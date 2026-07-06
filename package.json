@@ -1,0 +1,12 @@
+{
+  "name": "@wavey-ai/vin-yl-cache",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "make deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.101.0"
+  }
+}

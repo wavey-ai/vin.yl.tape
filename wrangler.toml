@@ -1,0 +1,19 @@
+name = "vin-yl-tape"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-27"
+account_id = "c57bb20727aa3564966d2bb693abddce"
+
+[limits]
+cpu_ms = 10
+
+routes = [
+  { pattern = "yl.vin/api/play/tape*", zone_name = "yl.vin" },
+]
+
+[[r2_buckets]]
+binding = "CACHE_BUCKET"
+bucket_name = "vin-yl-bucket-tape"
+preview_bucket_name = "vin-yl-bucket-tape-preview"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
