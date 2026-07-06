@@ -1,5 +1,5 @@
 {
-  "name": "@wavey-ai/vin-yl-cache",
+  "name": "@wavey-ai/vin-yl-tape",
   "version": "0.1.0",
   "private": true,
   "type": "module",

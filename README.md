@@ -378,7 +378,7 @@ npx wrangler secret put R2_PRESIGN_EXPIRES_SECONDS
 
 This repo also supports a local `.secrets` file for deployment. `make deploy` will:
 
-1. Read `CLOUDFLARE_API_TOKEN` from `.secrets`
+1. Read `CLOUDFLARE_EMAIL` and `CLOUDFLARE_API_KEY` from `.secrets`
 2. Push the `R2_PRESIGN_*` Worker secrets
 3. Deploy the Worker with Wrangler
 
