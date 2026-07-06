@@ -1,4 +1,4 @@
-# vin.yl.cache
+# vin.yl.tape
 
 Standalone Cloudflare Worker repo for the play tape API.
 
