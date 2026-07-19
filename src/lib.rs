@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const TAPE_API_PREFIX: &str = "/api/play/tape";
+const SOURCE_AUDIO_API_PREFIX: &str = "/api/bitneedle-source-audio";
 const CACHE_API_CONTENT_TYPE: &str = "application/vnd.bitneedle.brs1-chunk+binary";
 const CACHE_API_JSON_CONTENT_TYPE: &str = "application/json";
 const CACHE_API_MAX_BODY_BYTES: usize = 1_900_000;
@@ -59,6 +60,9 @@ const CACHE_API_MAX_BCE1_ENVELOPE_BYTES: usize =
     record_descriptor::CacheEncryptionEnvelope::HEADER_LENGTH
         + CACHE_API_MAX_OPUS_PAYLOAD_BYTES
         + record_descriptor::CACHE_ENCRYPTION_TAG_LENGTH;
+const SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES: usize = 256 * 1024;
+const SOURCE_AUDIO_UPLOAD_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
+const SOURCE_AUDIO_OBJECT_NAMESPACE: &str = "source-audio/v1/objects";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedChunk {
@@ -120,6 +124,25 @@ struct BatchWriteResponse {
     results: Vec<BatchWriteResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceAudioChunkManifest {
+    index: usize,
+    byte_length: usize,
+    sha256: String,
+    object_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceAudioUploadState {
+    object_id: String,
+    object_hash: String,
+    sealed: bool,
+    metadata: serde_json::Value,
+    chunks: Vec<SourceAudioChunkManifest>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheWriteResponse {
@@ -138,13 +161,19 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
     console_error_panic_hook::set_once();
 
     let url = request.url()?;
-    if !is_cache_api_path(url.path()) {
+    if !is_cache_api_path(url.path()) && !is_source_audio_api_path(url.path()) {
         return Response::ok("Not found\n").map(|response| response.with_status(404));
     }
 
     let origin = request.headers().get("Origin").ok().flatten();
 
-    match handle_cache_api_request(request, url, env, origin.as_deref()).await {
+    let result = if is_source_audio_api_path(url.path()) {
+        handle_source_audio_api_request(request, url, env, origin.as_deref()).await
+    } else {
+        handle_cache_api_request(request, url, env, origin.as_deref()).await
+    };
+
+    match result {
         Ok(response) => Ok(response),
         Err(error) => {
             console_warn!("[play-cache] request failed: {}", error);
@@ -161,8 +190,16 @@ fn is_cache_api_path(pathname: &str) -> bool {
     pathname == TAPE_API_PREFIX || pathname.starts_with(&format!("{TAPE_API_PREFIX}/"))
 }
 
+fn is_source_audio_api_path(pathname: &str) -> bool {
+    pathname == SOURCE_AUDIO_API_PREFIX || pathname.starts_with(&format!("{SOURCE_AUDIO_API_PREFIX}/"))
+}
+
 fn cache_api_relative_path(pathname: &str) -> Option<&str> {
     pathname.strip_prefix(TAPE_API_PREFIX)
+}
+
+fn source_audio_api_relative_path(pathname: &str) -> Option<&str> {
+    pathname.strip_prefix(SOURCE_AUDIO_API_PREFIX)
 }
 
 fn normalize_tape_version(version: &str) -> Option<String> {
@@ -258,6 +295,302 @@ async fn handle_cache_api_request(
     cache_api_json(
         &serde_json::json!({ "error": "Not found" }),
         404,
+        origin,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn handle_source_audio_api_request(
+    mut request: Request,
+    url: url::Url,
+    env: Env,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    if request.method() == Method::Options {
+        return with_cache_api_headers(Response::empty()?.with_status(204), origin);
+    }
+
+    let relative_path = source_audio_api_relative_path(url.path())
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let Some((object_id, action)) = parse_source_audio_object_action(relative_path) else {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Not found" }),
+            404,
+            origin,
+        );
+    };
+
+    match (request.method(), action.as_str()) {
+        (Method::Post, "uploads") => source_audio_create_upload(&mut request, &env, &object_id, origin).await,
+        (Method::Post, "chunks") => source_audio_append_chunk(&mut request, &env, &object_id, origin).await,
+        (Method::Post, "seal") => source_audio_seal_upload(&env, &object_id, origin).await,
+        (Method::Get, "manifest") => source_audio_read_manifest(&env, &object_id, origin).await,
+        _ => cache_api_json(
+            &serde_json::json!({ "error": "Method not allowed" }),
+            405,
+            origin,
+        ),
+    }
+}
+
+fn parse_source_audio_object_action(relative_path: &str) -> Option<(String, String)> {
+    let parts = relative_path.split('/').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "objects" || parts[1].is_empty() || parts[2].is_empty() {
+        return None;
+    }
+    let object_id = urlencoding::decode(parts[1]).ok()?.into_owned();
+    if !is_valid_source_audio_object_id(&object_id) {
+        return None;
+    }
+    Some((object_id, parts[2].to_ascii_lowercase()))
+}
+
+fn is_valid_source_audio_object_id(object_id: &str) -> bool {
+    !object_id.is_empty()
+        && object_id.len() <= 128
+        && object_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
+fn source_audio_object_hash(object_id: &str) -> String {
+    sha256_hex(object_id.as_bytes())
+}
+
+fn source_audio_state_key(object_hash: &str) -> String {
+    format!("{SOURCE_AUDIO_OBJECT_NAMESPACE}/{object_hash}/upload-state.json")
+}
+
+fn source_audio_manifest_key(object_hash: &str) -> String {
+    format!("{SOURCE_AUDIO_OBJECT_NAMESPACE}/{object_hash}/manifest.json")
+}
+
+fn source_audio_chunk_key(object_hash: &str, index: usize, chunk_hash: &str) -> String {
+    format!("{SOURCE_AUDIO_OBJECT_NAMESPACE}/{object_hash}/chunks/{index:06}-{chunk_hash}.bce1")
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn source_audio_read_state(
+    env: &Env,
+    object_hash: &str,
+) -> worker::Result<Option<SourceAudioUploadState>> {
+    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
+    let Some(object) = bucket.get(&source_audio_state_key(object_hash)).execute().await? else {
+        return Ok(None);
+    };
+    let Some(body) = object.body() else {
+        return Ok(None);
+    };
+    let bytes = body.bytes().await?;
+    if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn source_audio_write_state(
+    env: &Env,
+    state: &SourceAudioUploadState,
+) -> worker::Result<()> {
+    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
+    let bytes = serde_json::to_vec(state)?;
+    if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
+        return Err(worker::Error::RustError("source-audio upload state is too large".to_string()));
+    }
+    let mut http_metadata = HttpMetadata::default();
+    http_metadata.content_type = Some(CACHE_API_JSON_CONTENT_TYPE.to_string());
+    bucket
+        .put(&source_audio_state_key(&state.object_hash), bytes)
+        .http_metadata(http_metadata)
+        .execute()
+        .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn source_audio_create_upload(
+    request: &mut Request,
+    env: &Env,
+    object_id: &str,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    let bytes = request.bytes().await?;
+    if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Upload metadata is too large" }),
+            413,
+            origin,
+        );
+    }
+    let metadata = if bytes.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
+    };
+    let object_hash = source_audio_object_hash(object_id);
+    let state = SourceAudioUploadState {
+        object_id: object_id.to_string(),
+        object_hash: object_hash.clone(),
+        sealed: false,
+        metadata,
+        chunks: Vec::new(),
+    };
+    source_audio_write_state(env, &state).await?;
+    cache_api_json(
+        &serde_json::json!({
+            "ok": true,
+            "objectId": object_id,
+            "objectHash": object_hash,
+            "chunkCount": 0
+        }),
+        201,
+        origin,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn source_audio_append_chunk(
+    request: &mut Request,
+    env: &Env,
+    object_id: &str,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    let object_hash = source_audio_object_hash(object_id);
+    let Some(mut state) = source_audio_read_state(env, &object_hash).await? else {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Upload has not been created" }),
+            404,
+            origin,
+        );
+    };
+    if state.sealed {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Upload is already sealed" }),
+            409,
+            origin,
+        );
+    }
+    let bytes = request.bytes().await?;
+    if bytes.is_empty() || bytes.len() > SOURCE_AUDIO_UPLOAD_CHUNK_MAX_BYTES {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Invalid source-audio chunk size" }),
+            400,
+            origin,
+        );
+    }
+    let chunk_hash = sha256_hex(&bytes);
+    let index = state.chunks.len();
+    let object_key = source_audio_chunk_key(&object_hash, index, &chunk_hash);
+    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
+    let mut metadata = HashMap::new();
+    metadata.insert("objectHash".to_string(), object_hash.clone());
+    metadata.insert("chunkIndex".to_string(), index.to_string());
+    metadata.insert("sha256".to_string(), chunk_hash.clone());
+    let mut http_metadata = HttpMetadata::default();
+    http_metadata.content_type = Some(CACHE_API_OPUS_CONTENT_TYPE.to_string());
+    bucket
+        .put(&object_key, bytes.clone())
+        .custom_metadata(metadata)
+        .http_metadata(http_metadata)
+        .execute()
+        .await?;
+    let chunk = SourceAudioChunkManifest {
+        index,
+        byte_length: bytes.len(),
+        sha256: chunk_hash,
+        object_key,
+    };
+    state.chunks.push(chunk.clone());
+    source_audio_write_state(env, &state).await?;
+    cache_api_json(
+        &serde_json::json!({
+            "ok": true,
+            "objectId": object_id,
+            "objectHash": object_hash,
+            "chunk": chunk
+        }),
+        201,
+        origin,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn source_audio_seal_upload(
+    env: &Env,
+    object_id: &str,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    let object_hash = source_audio_object_hash(object_id);
+    let Some(mut state) = source_audio_read_state(env, &object_hash).await? else {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Upload has not been created" }),
+            404,
+            origin,
+        );
+    };
+    if state.chunks.is_empty() {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Upload has no chunks" }),
+            400,
+            origin,
+        );
+    }
+    state.sealed = true;
+    source_audio_write_state(env, &state).await?;
+    let manifest = serde_json::json!({
+        "ok": true,
+        "format": "bitneedle-source-audio-object-v1",
+        "objectId": state.object_id,
+        "objectHash": state.object_hash,
+        "sealed": true,
+        "metadata": state.metadata,
+        "chunkCount": state.chunks.len(),
+        "byteLength": state.chunks.iter().map(|chunk| chunk.byte_length).sum::<usize>(),
+        "chunks": state.chunks,
+    });
+    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
+    let bytes = serde_json::to_vec(&manifest)?;
+    let mut http_metadata = HttpMetadata::default();
+    http_metadata.content_type = Some(CACHE_API_JSON_CONTENT_TYPE.to_string());
+    bucket
+        .put(&source_audio_manifest_key(&object_hash), bytes)
+        .http_metadata(http_metadata)
+        .execute()
+        .await?;
+    cache_api_json(&manifest, 200, origin)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn source_audio_read_manifest(
+    env: &Env,
+    object_id: &str,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    let object_hash = source_audio_object_hash(object_id);
+    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
+    let Some(object) = bucket.get(&source_audio_manifest_key(&object_hash)).execute().await? else {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Not found" }),
+            404,
+            origin,
+        );
+    };
+    let Some(body) = object.body() else {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Manifest body unavailable" }),
+            500,
+            origin,
+        );
+    };
+    let headers = Headers::new();
+    headers.set("Content-Type", CACHE_API_JSON_CONTENT_TYPE)?;
+    headers.set("Cache-Control", "no-store")?;
+    with_cache_api_headers(
+        Response::from_bytes(body.bytes().await?)?
+            .with_status(200)
+            .with_headers(headers),
         origin,
     )
 }

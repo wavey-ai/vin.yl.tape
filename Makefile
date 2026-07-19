@@ -1,13 +1,16 @@
 ROOT := $(CURDIR)
 SECRETS_FILE := $(ROOT)/.secrets
 WRANGLER_CONFIG := $(ROOT)/wrangler.toml
-WRANGLER ?= npx wrangler
+WRANGLER ?= /Users/jamie/.npm/_npx/61e1327a8aba9411/node_modules/.bin/wrangler
 DEPLOY_ENV ?= CI=1
 
-.PHONY: build test deploy deploy-secrets
+.PHONY: build dev test deploy deploy-secrets
 
 build:
 	cargo build
+
+dev:
+	npx wrangler dev --config "$(WRANGLER_CONFIG)"
 
 test:
 	cargo test

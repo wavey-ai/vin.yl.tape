@@ -8,6 +8,8 @@ cpu_ms = 10
 
 routes = [
   { pattern = "yl.vin/api/play/tape*", zone_name = "yl.vin" },
+  { pattern = "yl.vin/api/bitneedle-source-audio", zone_name = "yl.vin" },
+  { pattern = "yl.vin/api/bitneedle-source-audio/*", zone_name = "yl.vin" },
 ]
 
 [[r2_buckets]]
