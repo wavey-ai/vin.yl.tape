@@ -12,7 +12,9 @@ The canonical public route in this repo is:
 
 The underlying cache payload formats and media types are intentionally kept compatible with the existing player clients.
 
-Each completed chunk is stored as a separate Cloudflare R2 object using a `hash:version` identifier where `hash` is the SHA-256 digest of the exact serialized chunk bytes. The same Worker also stores a record-level manifest under the same version namespace.
+Each completed chunk is a separate Cloudflare R2 object. Its `hash:version`
+identifier contains the SHA-256 digest of the exact serialized chunk bytes. The
+same Worker stores a record manifest in the same version namespace.
 
 ## Architecture
 
@@ -478,7 +480,7 @@ Recommended additional controls include:
 - per-session write quotas
 - maximum writes per time window
 - short-lived upload grants
-- requiring the chunk hash to appear in an authorised record manifest
+- requiring the chunk hash to appear in an authorized record manifest
 - verifying BCS2 chunk signatures against a trusted record key
 - Cloudflare WAF or rate-limiting rules
 - R2 lifecycle rules for unreferenced objects
@@ -508,7 +510,7 @@ Successful cache validation means:
 
 It does not by itself mean:
 
-- the artist authorised the chunk
+- the artist authorized the chunk
 - the payload is safe to decode
 - the signature is trusted
 - the supplied stream metadata belongs to an official release
