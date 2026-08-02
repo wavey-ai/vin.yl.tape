@@ -2,6 +2,17 @@
 
 Standalone Cloudflare Worker repo for the play tape API.
 
+This repository also contains the shared Rust client in `crates/vin-yl-tape-client`.
+
+The client owns cache keys, cache encryption, proof construction, HTTP retries, and response validation.
+Native and WebAssembly applications must use this client for tape cache requests.
+
+Add the client with an HTTPS Cargo dependency:
+
+```toml
+vin-yl-tape-client = { git = "https://github.com/wavey-ai/vin.yl.tape.git", branch = "main" }
+```
+
 This Worker provides an immutable, content-addressed tape store for individual `BRS1` chunks and record manifests.
 
 The canonical public route in this repo is:
