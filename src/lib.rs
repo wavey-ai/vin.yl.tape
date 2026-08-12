@@ -191,7 +191,8 @@ fn is_cache_api_path(pathname: &str) -> bool {
 }
 
 fn is_source_audio_api_path(pathname: &str) -> bool {
-    pathname == SOURCE_AUDIO_API_PREFIX || pathname.starts_with(&format!("{SOURCE_AUDIO_API_PREFIX}/"))
+    pathname == SOURCE_AUDIO_API_PREFIX
+        || pathname.starts_with(&format!("{SOURCE_AUDIO_API_PREFIX}/"))
 }
 
 fn cache_api_relative_path(pathname: &str) -> Option<&str> {
@@ -266,37 +267,7 @@ async fn handle_cache_api_request(
         return handle_batch_request(request, &env, origin).await;
     }
 
-    if let Ok(address) = parse_tape_chunk_path(relative_path) {
-        return match request.method() {
-            Method::Get => read_cache_api_object(&env, &address, false, origin).await,
-            Method::Head => read_cache_api_object(&env, &address, true, origin).await,
-            Method::Put => write_cache_api_object(&mut request, &env, &address, origin).await,
-            _ => cache_api_json(
-                &serde_json::json!({ "error": "Method not allowed" }),
-                405,
-                origin,
-            ),
-        };
-    }
-
-    if let Ok(address) = parse_tape_manifest_path(relative_path) {
-        return match request.method() {
-            Method::Get => read_tape_manifest(&env, &address, false, origin).await,
-            Method::Head => read_tape_manifest(&env, &address, true, origin).await,
-            Method::Put => write_tape_manifest(&mut request, &env, &address, origin).await,
-            _ => cache_api_json(
-                &serde_json::json!({ "error": "Method not allowed" }),
-                405,
-                origin,
-            ),
-        };
-    }
-
-    cache_api_json(
-        &serde_json::json!({ "error": "Not found" }),
-        404,
-        origin,
-    )
+    cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -314,16 +285,16 @@ async fn handle_source_audio_api_request(
         .unwrap_or("")
         .trim_start_matches('/');
     let Some((object_id, action)) = parse_source_audio_object_action(relative_path) else {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Not found" }),
-            404,
-            origin,
-        );
+        return cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin);
     };
 
     match (request.method(), action.as_str()) {
-        (Method::Post, "uploads") => source_audio_create_upload(&mut request, &env, &object_id, origin).await,
-        (Method::Post, "chunks") => source_audio_append_chunk(&mut request, &env, &object_id, origin).await,
+        (Method::Post, "uploads") => {
+            source_audio_create_upload(&mut request, &env, &object_id, origin).await
+        }
+        (Method::Post, "chunks") => {
+            source_audio_append_chunk(&mut request, &env, &object_id, origin).await
+        }
         (Method::Post, "seal") => source_audio_seal_upload(&env, &object_id, origin).await,
         (Method::Get, "manifest") => source_audio_read_manifest(&env, &object_id, origin).await,
         _ => cache_api_json(
@@ -376,7 +347,11 @@ async fn source_audio_read_state(
     object_hash: &str,
 ) -> worker::Result<Option<SourceAudioUploadState>> {
     let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let Some(object) = bucket.get(&source_audio_state_key(object_hash)).execute().await? else {
+    let Some(object) = bucket
+        .get(&source_audio_state_key(object_hash))
+        .execute()
+        .await?
+    else {
         return Ok(None);
     };
     let Some(body) = object.body() else {
@@ -390,14 +365,13 @@ async fn source_audio_read_state(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn source_audio_write_state(
-    env: &Env,
-    state: &SourceAudioUploadState,
-) -> worker::Result<()> {
+async fn source_audio_write_state(env: &Env, state: &SourceAudioUploadState) -> worker::Result<()> {
     let bucket = env.bucket(CACHE_API_R2_BINDING)?;
     let bytes = serde_json::to_vec(state)?;
     if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
-        return Err(worker::Error::RustError("source-audio upload state is too large".to_string()));
+        return Err(worker::Error::RustError(
+            "source-audio upload state is too large".to_string(),
+        ));
     }
     let mut http_metadata = HttpMetadata::default();
     http_metadata.content_type = Some(CACHE_API_JSON_CONTENT_TYPE.to_string());
@@ -570,12 +544,12 @@ async fn source_audio_read_manifest(
 ) -> worker::Result<Response> {
     let object_hash = source_audio_object_hash(object_id);
     let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let Some(object) = bucket.get(&source_audio_manifest_key(&object_hash)).execute().await? else {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Not found" }),
-            404,
-            origin,
-        );
+    let Some(object) = bucket
+        .get(&source_audio_manifest_key(&object_hash))
+        .execute()
+        .await?
+    else {
+        return cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin);
     };
     let Some(body) = object.body() else {
         return cache_api_json(
@@ -931,18 +905,10 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(target_arch = "wasm32")]
 fn cache_api_presign_config(env: &Env) -> Result<CacheApiPresignConfig, worker::Error> {
-    let account_id = env
-        .var("R2_PRESIGN_ACCOUNT_ID")?
-        .to_string();
-    let bucket_name = env
-        .var("R2_PRESIGN_BUCKET_NAME")?
-        .to_string();
-    let access_key_id = env
-        .var("R2_PRESIGN_ACCESS_KEY_ID")?
-        .to_string();
-    let secret_access_key = env
-        .var("R2_PRESIGN_SECRET_ACCESS_KEY")?
-        .to_string();
+    let account_id = env.var("R2_PRESIGN_ACCOUNT_ID")?.to_string();
+    let bucket_name = env.var("R2_PRESIGN_BUCKET_NAME")?.to_string();
+    let access_key_id = env.var("R2_PRESIGN_ACCESS_KEY_ID")?.to_string();
+    let secret_access_key = env.var("R2_PRESIGN_SECRET_ACCESS_KEY")?.to_string();
     let expires_seconds = env
         .var("R2_PRESIGN_EXPIRES_SECONDS")
         .ok()
@@ -1022,9 +988,7 @@ fn presign_r2_get_url(
     .as_string()
     .unwrap_or_default();
     Ok(PresignedGetUrl {
-        url: format!(
-            "https://{host}{canonical_uri}?{canonical_query}&X-Amz-Signature={signature}"
-        ),
+        url: format!("https://{host}{canonical_uri}?{canonical_query}&X-Amz-Signature={signature}"),
         expires_at,
     })
 }
@@ -1307,7 +1271,12 @@ async fn handle_batch_request(
     env: &Env,
     origin: Option<&str>,
 ) -> worker::Result<Response> {
-    let accept_header = request.headers().get("Accept").ok().flatten().unwrap_or_default();
+    let accept_header = request
+        .headers()
+        .get("Accept")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let prefer_stream_response = accept_header
         .split(',')
         .map(|part| part.trim())
@@ -1662,7 +1631,10 @@ fn cache_object_headers(address: &VersionedHash, size: u64) -> worker::Result<He
     headers.set("Content-Type", CACHE_API_CONTENT_TYPE)?;
     headers.set("Content-Length", &size.to_string())?;
     headers.set("Cache-Control", "public, max-age=31536000, immutable")?;
-    headers.set("ETag", &format!("\"sha256-{}:{}\"", address.hash, address.version))?;
+    headers.set(
+        "ETag",
+        &format!("\"sha256-{}:{}\"", address.hash, address.version),
+    )?;
     headers.set("X-Play-Cache-SHA256", &address.hash)?;
     headers.set("X-Play-Cache-Bytes", &size.to_string())?;
     headers.set("X-Play-Tape-Version", &address.version)?;

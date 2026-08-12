@@ -3,14 +3,15 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use record_descriptor::{
-    cache_encryption_record_binding_hash_hex, encrypt_cache_envelope, CacheEncryptionContext,
-    RecordDescriptor, CACHE_ENCRYPTION_SECRET_LENGTH,
+    cache_encryption_record_binding_hash_hex, decrypt_cache_envelope, encrypt_cache_envelope,
+    CacheEncryptionContext, RecordDescriptor, CACHE_ENCRYPTION_SECRET_LENGTH,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_API_BASE_URL: &str = "https://yl.vin/api/play/tape";
 pub const CACHE_BATCH_FORMAT: &str = "bitneedle-player-cache-batch-v1";
+pub const CACHE_BATCH_JSON_FORMAT: &str = "vin-yl-tape-batch-v2";
 pub const CACHE_STORE_NAME: &str = "opus-chunks";
 pub const CACHE_KEY_PREFIX: &str = "ecdc-opus";
 pub const CACHE_KEY_DOMAIN: &str = "bitneedle.opus-chunk-cache-key.v1";
@@ -18,6 +19,7 @@ pub const CACHE_VERSION: &str = "bitneedle-opus-chunk-cache-v3";
 pub const OUTPUT_CODEC: &str = "soundkit_opus_packets";
 pub const OUTPUT_BITRATE: u32 = 64_000;
 pub const MAX_BATCH_WRITES: usize = 32;
+pub const MAX_BATCH_READS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +56,28 @@ pub struct TapeBatchWriteResponse {
     pub results: Vec<TapeBatchWriteResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TapeBatchReadRequest {
+    pub format: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TapeBatchReadResult {
+    pub key: String,
+    pub hit: bool,
+    pub content_hash: Option<String>,
+    pub direct_get_url: Option<String>,
+    pub direct_get_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TapeBatchReadResponse {
+    pub format: String,
+    pub results: Vec<TapeBatchReadResult>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EcdcOpusWriteInput<'a> {
     pub record_descriptor_json: &'a str,
@@ -65,6 +89,12 @@ pub struct EcdcOpusWriteInput<'a> {
     pub packet_offset: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EcdcOpusReadInput<'a> {
+    pub record_descriptor_json: &'a str,
+    pub source_payload: &'a [u8],
+}
+
 pub fn generate_cache_encryption_secret_base64url() -> Result<String> {
     let mut secret = [0u8; CACHE_ENCRYPTION_SECRET_LENGTH];
     getrandom::getrandom(&mut secret).map_err(|error| {
@@ -74,17 +104,70 @@ pub fn generate_cache_encryption_secret_base64url() -> Result<String> {
 }
 
 pub fn ecdc_opus_cache_key(descriptor: &RecordDescriptor, source_payload: &[u8]) -> Result<String> {
+    let binding_hash = cache_encryption_record_binding_hash_hex(descriptor)
+        .context("failed to bind the cache key to the record")?;
+    ecdc_opus_cache_key_from_binding_hash(source_payload, &binding_hash)
+}
+
+pub fn ecdc_opus_cache_key_from_binding_hash(
+    source_payload: &[u8],
+    binding_hash: &str,
+) -> Result<String> {
     if source_payload.is_empty() {
         bail!("the ECDC source payload is empty");
     }
+    let binding_hash = binding_hash.trim().to_ascii_lowercase();
+    if binding_hash.len() != 64
+        || !binding_hash
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+    {
+        bail!("the record binding hash is invalid");
+    }
     let source_hash = hex::encode(Sha256::digest(source_payload));
-    let binding_hash = cache_encryption_record_binding_hash_hex(descriptor)
-        .context("failed to bind the cache key to the record")?;
     let preimage = format!(
         "{CACHE_KEY_DOMAIN}\nsource_payload_sha256={source_hash}\nrecord_binding_sha256={binding_hash}\noutput_codec={OUTPUT_CODEC}\nbitrate={OUTPUT_BITRATE}\ncache_version={CACHE_VERSION}\n"
     );
     let hash = hex::encode(Sha256::digest(preimage.as_bytes()));
     Ok(format!("{CACHE_KEY_PREFIX}/{hash}"))
+}
+
+pub fn batch_read_request(keys: Vec<String>) -> Result<TapeBatchReadRequest> {
+    if keys.is_empty() {
+        bail!("the tape lookup has no keys");
+    }
+    if keys.len() > MAX_BATCH_READS {
+        bail!("the tape lookup exceeds {MAX_BATCH_READS} keys");
+    }
+    Ok(TapeBatchReadRequest {
+        format: CACHE_BATCH_FORMAT.to_string(),
+        keys,
+    })
+}
+
+pub fn decrypt_ecdc_opus_entry(
+    record_descriptor_json: &str,
+    source_payload: &[u8],
+    envelope: &[u8],
+) -> Result<Vec<u8>> {
+    let descriptor: RecordDescriptor = serde_json::from_str(record_descriptor_json)
+        .context("the record descriptor JSON is invalid")?;
+    descriptor
+        .validate_cache_encryption()
+        .context("the record cache-encryption descriptor is invalid")?;
+    let key = ecdc_opus_cache_key(&descriptor, source_payload)?;
+    let context = CacheEncryptionContext {
+        protocol_version: 1,
+        cache_format_version: 1,
+        cache_store_name: CACHE_STORE_NAME.to_string(),
+        cache_key: key,
+        chunk_index: 0,
+        packet_offset: 0,
+        plaintext_length: 0,
+        codec_identifier: OUTPUT_CODEC.to_string(),
+    };
+    decrypt_cache_envelope(&descriptor, &context, envelope)
+        .context("failed to decrypt the tape cache entry")
 }
 
 pub fn prepare_ecdc_opus_write(input: EcdcOpusWriteInput<'_>) -> Result<PreparedTapeWrite> {
@@ -180,6 +263,68 @@ impl TapeClient {
             stored += self.upload_batch(batch.to_vec()).await?;
         }
         Ok(stored)
+    }
+
+    pub async fn read_ecdc_opus(&self, input: EcdcOpusReadInput<'_>) -> Result<Option<Vec<u8>>> {
+        let descriptor: RecordDescriptor = serde_json::from_str(input.record_descriptor_json)
+            .context("the record descriptor JSON is invalid")?;
+        descriptor
+            .validate_cache_encryption()
+            .context("the record cache-encryption descriptor is invalid")?;
+        let key = ecdc_opus_cache_key(&descriptor, input.source_payload)?;
+        let request = batch_read_request(vec![key.clone()])?;
+        let url = format!("{}/batch", self.api_base_url);
+        let response = self
+            .http
+            .post(&url)
+            .header("Accept", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("the tape lookup failed")?;
+        if !response.status().is_success() {
+            bail!("the tape lookup failed with status {}", response.status());
+        }
+        let response: TapeBatchReadResponse = response
+            .json()
+            .await
+            .context("the tape lookup response is invalid")?;
+        if response.format != CACHE_BATCH_JSON_FORMAT || response.results.len() != 1 {
+            bail!("the tape lookup response format is invalid");
+        }
+        let result = &response.results[0];
+        if result.key != key {
+            bail!("the tape lookup returned the wrong key");
+        }
+        if !result.hit {
+            return Ok(None);
+        }
+        let direct_get_url = result
+            .direct_get_url
+            .as_deref()
+            .context("the tape lookup did not return a direct read URL")?;
+        let envelope = self
+            .http
+            .get(direct_get_url)
+            .send()
+            .await
+            .context("the tape object download failed")?;
+        if !envelope.status().is_success() {
+            bail!(
+                "the tape object download failed with status {}",
+                envelope.status()
+            );
+        }
+        let envelope = envelope
+            .bytes()
+            .await
+            .context("the tape object body is invalid")?;
+        decrypt_ecdc_opus_entry(
+            input.record_descriptor_json,
+            input.source_payload,
+            &envelope,
+        )
+        .map(Some)
     }
 
     async fn upload_batch(&self, writes: Vec<PreparedTapeWrite>) -> Result<usize> {
@@ -298,6 +443,16 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_from_binding_matches_descriptor_key() {
+        let descriptor = descriptor();
+        let binding = cache_encryption_record_binding_hash_hex(&descriptor).expect("binding");
+        assert_eq!(
+            ecdc_opus_cache_key(&descriptor, b"source").expect("descriptor key"),
+            ecdc_opus_cache_key_from_binding_hash(b"source", &binding).expect("binding key")
+        );
+    }
+
+    #[test]
     fn prepared_write_contains_an_encrypted_bce1_envelope() {
         let descriptor_json = serde_json::to_string(&descriptor()).expect("descriptor JSON");
         let write = prepare_ecdc_opus_write(EcdcOpusWriteInput {
@@ -316,5 +471,8 @@ mod tests {
         assert_eq!(&envelope[..4], b"BCE1");
         assert_eq!(write.proof.body_byte_length, envelope.len());
         assert_eq!(write.proof.chunk_byte_length, b"ecdc chunk".len());
+        let decrypted = decrypt_ecdc_opus_entry(&descriptor_json, b"ecdc chunk", &envelope)
+            .expect("decrypted entry");
+        assert_eq!(decrypted, b"soundkit opus packets");
     }
 }
