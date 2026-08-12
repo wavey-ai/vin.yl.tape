@@ -9,7 +9,7 @@ use record_descriptor::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "http")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_API_BASE_URL: &str = "https://yl.vin/api/play/tape";
 pub const CACHE_BATCH_FORMAT: &str = "bitneedle-player-cache-batch-v1";
@@ -290,7 +290,13 @@ impl TapeClient {
                 .context("the record cache-encryption descriptor is invalid")?;
             keys.push(ecdc_opus_cache_key(&descriptor, input.source_payload)?);
         }
-        let request = batch_read_request(keys.clone())?;
+        let mut seen = HashSet::with_capacity(keys.len());
+        let unique_keys = keys
+            .iter()
+            .filter(|key| seen.insert((*key).clone()))
+            .cloned()
+            .collect();
+        let request = batch_read_request(unique_keys)?;
         let url = format!("{}/batch", self.api_base_url);
         let response = self
             .http
