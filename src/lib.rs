@@ -3,11 +3,6 @@
 use base64::{engine::general_purpose, Engine as _};
 #[cfg(target_arch = "wasm32")]
 use hmac::{Hmac, Mac};
-use record_core::chunk::{parse_chunk_section, verify_chunk_crc32};
-use record_core::{
-    chunk_nonce_length_from_metadata_bytes, record_stream_header_end, RECORD_STREAM_HEADER_LENGTH,
-    RECORD_STREAM_MAGIC,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(target_arch = "wasm32")]
@@ -15,19 +10,11 @@ use std::collections::HashMap;
 
 const TAPE_API_PREFIX: &str = "/api/play/tape";
 const SOURCE_AUDIO_API_PREFIX: &str = "/api/bitneedle-source-audio";
-const CACHE_API_CONTENT_TYPE: &str = "application/vnd.bitneedle.brs1-chunk+binary";
 const CACHE_API_JSON_CONTENT_TYPE: &str = "application/json";
-const CACHE_API_MAX_BODY_BYTES: usize = 1_900_000;
-const CACHE_API_MAX_STREAM_HEADER_BYTES: usize = 256 * 1024;
 const CACHE_API_HASH_LENGTH: usize = 64;
 const TAPE_API_DEFAULT_VERSION: &str = "v1";
 const TAPE_API_MAX_VERSION_LENGTH: usize = 32;
-const TAPE_API_MANIFEST_PREFIX: &str = "record-manifests/sha256";
-const TAPE_API_MANIFEST_MAX_BODY_BYTES: usize = 512 * 1024;
-const CACHE_API_STREAM_HEADER_HEADER: &str = "X-Play-BRS1-Header";
-const CACHE_API_BODY_BYTES_HEADER: &str = "X-Play-Cache-Body-Bytes";
 const CACHE_API_R2_BINDING: &str = "CACHE_BUCKET";
-const CACHE_API_OBJECT_NAMESPACE: &str = "brs1-chunks/sha256";
 
 const CACHE_API_BATCH_FORMAT: &str = "bitneedle-player-cache-batch-v1";
 const CACHE_API_BATCH_STREAM_CONTENT_TYPE: &str =
@@ -54,7 +41,6 @@ const CACHE_API_MAX_WRITE_BATCH_ENTRIES: usize = 32;
 const CACHE_API_BATCH_JSON_FORMAT: &str = "vin-yl-tape-batch-v2";
 const CACHE_API_PRESIGN_EXPIRES_SECONDS: u32 = 300;
 // Per-chunk limits: 2s × 128kbps stereo with 4× headroom.
-const CACHE_API_MIN_OPUS_PAYLOAD_BYTES: usize = 64;
 const CACHE_API_MAX_OPUS_PAYLOAD_BYTES: usize = 131_072; // 128 KB
 const CACHE_API_MAX_BCE1_ENVELOPE_BYTES: usize =
     record_descriptor::CacheEncryptionEnvelope::HEADER_LENGTH
@@ -63,19 +49,6 @@ const CACHE_API_MAX_BCE1_ENVELOPE_BYTES: usize =
 const SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES: usize = 256 * 1024;
 const SOURCE_AUDIO_UPLOAD_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SOURCE_AUDIO_OBJECT_NAMESPACE: &str = "source-audio/v1/objects";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ValidatedChunk {
-    payload_byte_length: usize,
-    crc32: u32,
-    stream_metadata_sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VersionedHash {
-    hash: String,
-    version: String,
-}
 
 #[derive(Debug, Deserialize)]
 struct BatchReadRequest {
@@ -141,15 +114,6 @@ struct SourceAudioUploadState {
     sealed: bool,
     metadata: serde_json::Value,
     chunks: Vec<SourceAudioChunkManifest>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CacheWriteResponse {
-    hash: String,
-    status: String,
-    byte_length: usize,
-    payload_byte_length: usize,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -218,32 +182,9 @@ fn normalize_tape_version(version: &str) -> Option<String> {
     }
 }
 
-fn parse_versioned_hash_identifier(value: &str) -> Result<VersionedHash, &'static str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("Not found");
-    }
-    let (hash_part, version_part) = match trimmed.split_once(':') {
-        Some((hash, version)) => (hash, version),
-        None => (trimmed, TAPE_API_DEFAULT_VERSION),
-    };
-    let hash = hash_part.trim().to_ascii_lowercase();
-    if !is_sha256_hex(&hash) {
-        return Err("Tape key must start with a 64-character lowercase SHA-256 hex digest");
-    }
-    let Some(version) = normalize_tape_version(version_part) else {
-        return Err("Tape key version is invalid");
-    };
-    Ok(VersionedHash { hash, version })
-}
-
-fn format_versioned_hash_identifier(address: &VersionedHash) -> String {
-    format!("{}:{}", address.hash, address.version)
-}
-
 #[cfg(target_arch = "wasm32")]
 async fn handle_cache_api_request(
-    mut request: Request,
+    request: Request,
     url: url::Url,
     env: Env,
     origin: Option<&str>,
@@ -569,175 +510,6 @@ async fn source_audio_read_manifest(
     )
 }
 
-fn parse_tape_chunk_path(relative_path: &str) -> Result<VersionedHash, &'static str> {
-    let parts = relative_path.split('/').collect::<Vec<_>>();
-    if parts.len() != 2 || parts[0] != "brs1-chunks" || parts[1].is_empty() {
-        return Err("Not found");
-    }
-    let identifier = urlencoding::decode(parts[1])
-        .map_err(|_| "Invalid tape path")?
-        .into_owned();
-    parse_versioned_hash_identifier(&identifier)
-}
-
-fn parse_tape_manifest_path(relative_path: &str) -> Result<VersionedHash, &'static str> {
-    let parts = relative_path.split('/').collect::<Vec<_>>();
-    if parts.len() != 2 || parts[0] != "record-manifests" || parts[1].is_empty() {
-        return Err("Not found");
-    }
-    let identifier = urlencoding::decode(parts[1])
-        .map_err(|_| "Invalid tape path")?
-        .into_owned();
-    parse_versioned_hash_identifier(&identifier)
-}
-
-fn tape_chunk_object_key(address: &VersionedHash) -> String {
-    format!(
-        "{}/{}/{}/{}/{}",
-        address.version,
-        CACHE_API_OBJECT_NAMESPACE,
-        &address.hash[0..2],
-        &address.hash[2..4],
-        address.hash
-    )
-}
-
-fn tape_manifest_object_key(address: &VersionedHash) -> String {
-    format!(
-        "{}/{}/{}/{}/{}.json",
-        address.version,
-        TAPE_API_MANIFEST_PREFIX,
-        &address.hash[0..2],
-        &address.hash[2..4],
-        address.hash
-    )
-}
-
-fn parse_cache_api_lookup_path(relative_path: &str) -> Result<String, &'static str> {
-    parse_tape_chunk_path(relative_path).map(|address| address.hash)
-}
-
-fn cache_api_object_key(hash: &str) -> String {
-    tape_chunk_object_key(&VersionedHash {
-        hash: hash.to_string(),
-        version: TAPE_API_DEFAULT_VERSION.to_string(),
-    })
-}
-
-fn validate_manifest_json_bytes(bytes: &[u8]) -> Result<(), &'static str> {
-    if bytes.is_empty() {
-        return Err("Record manifest body is empty");
-    }
-    if bytes.len() > TAPE_API_MANIFEST_MAX_BODY_BYTES {
-        return Err("Record manifest body is too large");
-    }
-    let manifest: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| "Record manifest body is not valid JSON")?;
-    if !manifest.is_object() {
-        return Err("Record manifest body must be a JSON object");
-    }
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn write_tape_manifest(
-    request: &mut Request,
-    env: &Env,
-    address: &VersionedHash,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let content_type = request
-        .headers()
-        .get("Content-Type")?
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if content_type != CACHE_API_JSON_CONTENT_TYPE {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Unsupported manifest payload type" }),
-            415,
-            origin,
-        );
-    }
-
-    let body = request.bytes().await?;
-    if let Err(error) = validate_manifest_json_bytes(&body) {
-        return cache_api_json(&serde_json::json!({ "error": error }), 400, origin);
-    }
-
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let object_key = tape_manifest_object_key(address);
-    let mut http_metadata = HttpMetadata::default();
-    http_metadata.content_type = Some(CACHE_API_JSON_CONTENT_TYPE.to_string());
-    bucket
-        .put(&object_key, body)
-        .http_metadata(http_metadata)
-        .execute()
-        .await?;
-
-    cache_api_json(
-        &serde_json::json!({
-            "recordHash": address.hash,
-            "version": address.version,
-            "status": "stored"
-        }),
-        201,
-        origin,
-    )
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn read_tape_manifest(
-    env: &Env,
-    address: &VersionedHash,
-    head_only: bool,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let object_key = tape_manifest_object_key(address);
-
-    if head_only {
-        let Some(object) = bucket.head(&object_key).await? else {
-            return with_cache_api_headers(Response::empty()?.with_status(404), origin);
-        };
-        let headers = Headers::new();
-        headers.set("Content-Type", CACHE_API_JSON_CONTENT_TYPE)?;
-        headers.set("Content-Length", &object.size().to_string())?;
-        headers.set("Cache-Control", "public, max-age=60")?;
-        headers.set("X-Play-Tape-Version", &address.version)?;
-        headers.set("X-Play-Tape-Record-Hash", &address.hash)?;
-        return with_cache_api_headers(
-            Response::empty()?.with_status(200).with_headers(headers),
-            origin,
-        );
-    }
-
-    let Some(object) = bucket.get(&object_key).execute().await? else {
-        return with_cache_api_headers(Response::empty()?.with_status(404), origin);
-    };
-    let size = object.size();
-    let body = object
-        .body()
-        .ok_or_else(|| worker::Error::RustError("R2 manifest body is unavailable".to_string()))?
-        .bytes()
-        .await?;
-    let headers = Headers::new();
-    headers.set("Content-Type", CACHE_API_JSON_CONTENT_TYPE)?;
-    headers.set("Content-Length", &size.to_string())?;
-    headers.set("Cache-Control", "public, max-age=60")?;
-    headers.set("X-Play-Tape-Version", &address.version)?;
-    headers.set("X-Play-Tape-Record-Hash", &address.hash)?;
-    with_cache_api_headers(
-        Response::from_bytes(body)?
-            .with_status(200)
-            .with_headers(headers),
-        origin,
-    )
-}
-
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == CACHE_API_HASH_LENGTH
         && value
@@ -755,8 +527,7 @@ fn validate_opus_proof(proof: &serde_json::Value, payload: &[u8]) -> Result<(), 
 
     let encoded = record_header
         .strip_prefix("ecdc-v2:")
-        .or_else(|| record_header.strip_prefix("brs1-v2:"))
-        .ok_or("proof.recordHeader must use ecdc-v2 or brs1-v2 prefix")?;
+        .ok_or("proof.recordHeader must use the ecdc-v2 prefix")?;
 
     let header_bytes = general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
@@ -993,278 +764,6 @@ fn presign_r2_get_url(
     })
 }
 
-fn decode_stream_header(value: &str) -> Result<Vec<u8>, String> {
-    let encoded = value
-        .trim()
-        .strip_prefix("brs1-v2:")
-        .ok_or_else(|| "BRS1 header proof must use brs1-v2".to_string())?;
-
-    let bytes = general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .or_else(|_| general_purpose::URL_SAFE.decode(encoded))
-        .or_else(|_| general_purpose::STANDARD.decode(encoded))
-        .map_err(|_| "BRS1 header proof is not valid base64".to_string())?;
-
-    if bytes.len() < RECORD_STREAM_HEADER_LENGTH {
-        return Err("BRS1 header proof is too small".to_string());
-    }
-
-    if bytes.len() > CACHE_API_MAX_STREAM_HEADER_BYTES {
-        return Err("BRS1 header proof is too large".to_string());
-    }
-
-    if bytes.get(0..4) != Some(RECORD_STREAM_MAGIC.as_slice()) {
-        return Err("BRS1 header proof magic is invalid".to_string());
-    }
-
-    let header_end = record_stream_header_end(&bytes)
-        .map_err(|error| format!("Invalid BRS1 header proof: {error}"))?;
-
-    if header_end != bytes.len() {
-        return Err("BRS1 header proof must not include chunk bytes".to_string());
-    }
-
-    Ok(bytes)
-}
-
-fn validate_brs1_chunk(stream_header: &[u8], chunk_bytes: &[u8]) -> Result<ValidatedChunk, String> {
-    if chunk_bytes.is_empty() {
-        return Err("BRS1 chunk is empty".to_string());
-    }
-
-    if chunk_bytes.len() > CACHE_API_MAX_BODY_BYTES {
-        return Err("BRS1 chunk is too large".to_string());
-    }
-
-    let metadata_bytes = &stream_header[RECORD_STREAM_HEADER_LENGTH..];
-
-    let nonce_length = chunk_nonce_length_from_metadata_bytes(metadata_bytes)
-        .map_err(|error| format!("Invalid BRS1 encryption metadata: {error}"))?;
-
-    let ranges = parse_chunk_section(chunk_bytes, 0, nonce_length.is_some())
-        .map_err(|error| format!("Invalid BRS1 chunk: {error}"))?;
-
-    let [range] = ranges.as_slice() else {
-        return Err("BRS1 chunk body must contain exactly one chunk".to_string());
-    };
-
-    if range.chunk_end != chunk_bytes.len() {
-        return Err("BRS1 chunk has trailing bytes".to_string());
-    }
-
-    if !verify_chunk_crc32(chunk_bytes, range) {
-        return Err("BRS1 chunk CRC32 mismatch".to_string());
-    }
-
-    Ok(ValidatedChunk {
-        payload_byte_length: range.payload_end - range.payload_start,
-        crc32: range.crc32,
-        stream_metadata_sha256: sha256_hex(metadata_bytes),
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn cache_api_header_string(headers: &Headers, name: &str) -> Result<String, String> {
-    headers
-        .get(name)
-        .map_err(|_| format!("Invalid {name} header"))?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("Missing {name} header"))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn cache_api_header_usize(headers: &Headers, name: &str) -> Result<usize, String> {
-    cache_api_header_string(headers, name)?
-        .parse::<usize>()
-        .map_err(|_| format!("Invalid {name} header"))
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn write_cache_api_object(
-    request: &mut Request,
-    env: &Env,
-    address: &VersionedHash,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let content_type = request
-        .headers()
-        .get("Content-Type")?
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-
-    if content_type != CACHE_API_CONTENT_TYPE {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Unsupported cache payload type" }),
-            415,
-            origin,
-        );
-    }
-
-    let declared_body_bytes =
-        match cache_api_header_usize(request.headers(), CACHE_API_BODY_BYTES_HEADER) {
-            Ok(value) => value,
-            Err(error) => {
-                return cache_api_json(&serde_json::json!({ "error": error }), 400, origin);
-            }
-        };
-
-    if declared_body_bytes == 0 || declared_body_bytes > CACHE_API_MAX_BODY_BYTES {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Cache payload byte length is invalid" }),
-            413,
-            origin,
-        );
-    }
-
-    let stream_header_text =
-        match cache_api_header_string(request.headers(), CACHE_API_STREAM_HEADER_HEADER) {
-            Ok(value) => value,
-            Err(error) => {
-                return cache_api_json(&serde_json::json!({ "error": error }), 400, origin);
-            }
-        };
-
-    let stream_header = match decode_stream_header(&stream_header_text) {
-        Ok(value) => value,
-        Err(error) => {
-            return cache_api_json(&serde_json::json!({ "error": error }), 400, origin);
-        }
-    };
-
-    let body = request.bytes().await?;
-
-    if body.len() != declared_body_bytes {
-        return cache_api_json(
-            &serde_json::json!({
-                "error": "Cache body byte length header does not match upload body"
-            }),
-            400,
-            origin,
-        );
-    }
-
-    let actual_hash = sha256_hex(&body);
-
-    if actual_hash != address.hash {
-        return cache_api_json(
-            &serde_json::json!({
-                "error": "Tape object SHA-256 does not match the requested content address",
-                "actualHash": actual_hash
-            }),
-            409,
-            origin,
-        );
-    }
-
-    let envelope_valid = is_bce1_envelope(&body);
-    let payload_byte_length = if envelope_valid {
-        match validate_bce1_envelope(&body) {
-            Ok(()) => record_descriptor::CacheEncryptionEnvelope::parse(&body)
-                .map(|envelope| envelope.plaintext_length as usize)
-                .map_err(|error| worker::Error::RustError(error.to_string()))?,
-            Err(error) => {
-                return cache_api_json(&serde_json::json!({ "error": error }), 400, origin);
-            }
-        }
-    } else {
-        let validated = match validate_brs1_chunk(&stream_header, &body) {
-            Ok(value) => value,
-            Err(error) => {
-                return cache_api_json(&serde_json::json!({ "error": error }), 400, origin);
-            }
-        };
-        validated.payload_byte_length
-    };
-
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let object_key = tape_chunk_object_key(address);
-
-    if let Some(existing) = bucket.head(&object_key).await? {
-        if existing.size() != body.len() as u64 {
-            return cache_api_json(
-                &serde_json::json!({
-                    "error": "Existing content-addressed object has an unexpected byte length"
-                }),
-                500,
-                origin,
-            );
-        }
-
-        return cache_api_json(
-            &CacheWriteResponse {
-                hash: address.hash.to_string(),
-                status: "exists".to_string(),
-                byte_length: body.len(),
-                payload_byte_length,
-            },
-            200,
-            origin,
-        );
-    }
-
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "format".to_string(),
-        if envelope_valid {
-            "bce1-opus-v1"
-        } else {
-            "brs1-chunk-v2"
-        }
-        .to_string(),
-    );
-    metadata.insert("sha256".to_string(), address.hash.to_string());
-    metadata.insert("version".to_string(), address.version.to_string());
-    metadata.insert("byteLength".to_string(), body.len().to_string());
-    metadata.insert(
-        "payloadByteLength".to_string(),
-        payload_byte_length.to_string(),
-    );
-    if !envelope_valid {
-        if let Ok(validated) = validate_brs1_chunk(&stream_header, &body) {
-            metadata.insert("crc32".to_string(), format!("{:08x}", validated.crc32));
-            metadata.insert(
-                "streamMetadataSha256".to_string(),
-                validated.stream_metadata_sha256,
-            );
-        }
-    }
-
-    let checksum = hex::decode(&address.hash)
-        .map_err(|_| worker::Error::RustError("Invalid SHA-256 key".to_string()))?;
-
-    let object = bucket
-        .put(&object_key, body)
-        .custom_metadata(metadata)
-        .sha256(checksum)
-        .execute()
-        .await?
-        .ok_or_else(|| worker::Error::RustError("R2 rejected the cache write".to_string()))?;
-
-    if object.size() != declared_body_bytes as u64 {
-        return cache_api_json(
-            &serde_json::json!({ "error": "R2 stored an unexpected object length" }),
-            500,
-            origin,
-        );
-    }
-
-    cache_api_json(
-        &CacheWriteResponse {
-            hash: address.hash.to_string(),
-            status: "stored".to_string(),
-            byte_length: declared_body_bytes,
-            payload_byte_length,
-        },
-        201,
-        origin,
-    )
-}
-
 #[cfg(target_arch = "wasm32")]
 async fn handle_batch_request(
     mut request: Request,
@@ -1333,7 +832,6 @@ async fn handle_batch_read(
     let mut keys: Vec<BatchReadKeyResult> = Vec::new();
 
     {
-        let mut count = 0usize;
         for raw_key in req.keys.iter().take(CACHE_API_MAX_READ_BATCH_ENTRIES) {
             let Some((prefix, lookup_key, version)) = parse_batch_cache_key(raw_key) else {
                 keys.push(BatchReadKeyResult {
@@ -1363,7 +861,6 @@ async fn handle_batch_read(
                     direct_get_url: None,
                     direct_get_expires_at: None,
                 });
-                count += 1;
                 continue;
             };
             let Some(pointer_body_handle) = pointer_object.body() else {
@@ -1374,7 +871,6 @@ async fn handle_batch_read(
                     direct_get_url: None,
                     direct_get_expires_at: None,
                 });
-                count += 1;
                 continue;
             };
             let pointer_bytes = pointer_body_handle.bytes().await?;
@@ -1386,7 +882,6 @@ async fn handle_batch_read(
                     direct_get_url: None,
                     direct_get_expires_at: None,
                 });
-                count += 1;
                 continue;
             };
             if !is_sha256_hex(&content_hash_hex) {
@@ -1397,7 +892,6 @@ async fn handle_batch_read(
                     direct_get_url: None,
                     direct_get_expires_at: None,
                 });
-                count += 1;
                 continue;
             }
             let content_key = opus_content_object_key(&prefix, &content_hash_hex, &version);
@@ -1409,7 +903,6 @@ async fn handle_batch_read(
                     direct_get_url: None,
                     direct_get_expires_at: None,
                 });
-                count += 1;
                 continue;
             };
             let direct_get = presign_config
@@ -1423,16 +916,13 @@ async fn handle_batch_read(
                 direct_get_expires_at: direct_get.as_ref().map(|value| value.expires_at.clone()),
             });
             if !prefer_stream_response {
-                count += 1;
                 continue;
             }
             let Some(body_handle) = object.body() else {
-                count += 1;
                 continue;
             };
             let payload = body_handle.bytes().await?;
             if payload.is_empty() {
-                count += 1;
                 continue;
             }
             let key_bytes = key.as_bytes();
@@ -1440,7 +930,6 @@ async fn handle_batch_read(
             frame_buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
             frame_buf.extend_from_slice(key_bytes);
             frame_buf.extend_from_slice(&payload);
-            count += 1;
         }
     }
 
@@ -1568,80 +1057,6 @@ async fn handle_batch_write(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn read_cache_api_object(
-    env: &Env,
-    address: &VersionedHash,
-    head_only: bool,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let object_key = tape_chunk_object_key(address);
-
-    if head_only {
-        let Some(object) = bucket.head(&object_key).await? else {
-            return with_cache_api_headers(Response::empty()?.with_status(404), origin);
-        };
-
-        let headers = cache_object_headers(address, object.size())?;
-        return with_cache_api_headers(
-            Response::empty()?.with_status(200).with_headers(headers),
-            origin,
-        );
-    }
-
-    let Some(object) = bucket.get(&object_key).execute().await? else {
-        return with_cache_api_headers(Response::empty()?.with_status(404), origin);
-    };
-
-    let size = object.size();
-    let body = object
-        .body()
-        .ok_or_else(|| worker::Error::RustError("R2 object body is unavailable".to_string()))?
-        .bytes()
-        .await?;
-
-    if body.len() as u64 != size {
-        return cache_api_json(
-            &serde_json::json!({ "error": "R2 object length mismatch" }),
-            500,
-            origin,
-        );
-    }
-
-    if sha256_hex(&body) != address.hash {
-        return cache_api_json(
-            &serde_json::json!({ "error": "R2 object content hash mismatch" }),
-            500,
-            origin,
-        );
-    }
-
-    let headers = cache_object_headers(address, size)?;
-    with_cache_api_headers(
-        Response::from_bytes(body)?
-            .with_status(200)
-            .with_headers(headers),
-        origin,
-    )
-}
-
-#[cfg(target_arch = "wasm32")]
-fn cache_object_headers(address: &VersionedHash, size: u64) -> worker::Result<Headers> {
-    let headers = Headers::new();
-    headers.set("Content-Type", CACHE_API_CONTENT_TYPE)?;
-    headers.set("Content-Length", &size.to_string())?;
-    headers.set("Cache-Control", "public, max-age=31536000, immutable")?;
-    headers.set(
-        "ETag",
-        &format!("\"sha256-{}:{}\"", address.hash, address.version),
-    )?;
-    headers.set("X-Play-Cache-SHA256", &address.hash)?;
-    headers.set("X-Play-Cache-Bytes", &size.to_string())?;
-    headers.set("X-Play-Tape-Version", &address.version)?;
-    Ok(headers)
-}
-
-#[cfg(target_arch = "wasm32")]
 fn cache_api_json<T: Serialize>(
     payload: &T,
     status: u16,
@@ -1670,14 +1085,8 @@ fn with_cache_api_headers(
     headers.set("Cross-Origin-Resource-Policy", "cross-origin")?;
     headers.set("X-Content-Type-Options", "nosniff")?;
     headers.set("Referrer-Policy", "strict-origin-when-cross-origin")?;
-    headers.set(
-        "Access-Control-Allow-Methods",
-        "GET, HEAD, PUT, POST, OPTIONS",
-    )?;
-    headers.set(
-        "Access-Control-Allow-Headers",
-        &format!("Content-Type, {CACHE_API_STREAM_HEADER_HEADER}, {CACHE_API_BODY_BYTES_HEADER}"),
-    )?;
+    headers.set("Access-Control-Allow-Methods", "POST, OPTIONS")?;
+    headers.set("Access-Control-Allow-Headers", "Content-Type")?;
     headers.set(
         "Access-Control-Expose-Headers",
         "Content-Length, ETag, X-Play-Cache-SHA256, X-Play-Cache-Bytes",
@@ -1743,60 +1152,8 @@ fn is_private_lan_hostname(hostname: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use record_core::chunk::encode_unencrypted_chunk;
-    use record_core::{CONTAINER_EXTENSION, RECORD_STREAM_MAGIC, RECORD_STREAM_METADATA_VERSION};
 
     const TEST_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    fn stream_header_for_payload(payload: &[u8]) -> Vec<u8> {
-        let mut metadata = Vec::new();
-
-        // RecordStreamMetadata v1.
-        metadata.push(RECORD_STREAM_METADATA_VERSION);
-
-        // Unencrypted; descriptor indexes and track mappings are implicit.
-        metadata.push(0);
-
-        // One extension payload descriptor, with no optional fields.
-        metadata.push(1);
-        metadata.push(CONTAINER_EXTENSION);
-        metadata.extend_from_slice(&4_u16.to_be_bytes());
-        metadata.extend_from_slice(b"TEST");
-        metadata.push(0);
-
-        // One payload entry.
-        metadata.extend_from_slice(&1_u16.to_be_bytes());
-        push_test_varuint(&mut metadata, payload.len() as u64);
-
-        // One track, implicitly mapped to payload entry zero.
-        metadata.extend_from_slice(&1_u16.to_be_bytes());
-        metadata.extend_from_slice(&4_u16.to_be_bytes());
-        metadata.extend_from_slice(b"Test");
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(RECORD_STREAM_MAGIC);
-        bytes.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&metadata);
-        bytes
-    }
-
-    fn push_test_varuint(out: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
-    }
-
-    fn serialized_chunk(payload: &[u8]) -> Vec<u8> {
-        encode_unencrypted_chunk(payload).unwrap()
-    }
 
     #[test]
     fn accepts_sha256_key() {
@@ -1808,49 +1165,6 @@ mod tests {
         assert!(!is_sha256_hex(
             "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
         ));
-    }
-
-    #[test]
-    fn derives_sharded_r2_key() {
-        assert_eq!(
-            cache_api_object_key(TEST_HASH),
-            format!("v1/brs1-chunks/sha256/01/23/{}", TEST_HASH)
-        );
-    }
-
-    #[test]
-    fn parses_versioned_hash_identifier() {
-        let address = parse_versioned_hash_identifier(&format!("{TEST_HASH}:tape")).unwrap();
-        assert_eq!(address.hash, TEST_HASH);
-        assert_eq!(address.version, "tape");
-    }
-
-    #[test]
-    fn validates_generic_brs1_chunk() {
-        let payload = b"payload in any descriptor-defined container";
-        let chunk = serialized_chunk(payload);
-        let validated = validate_brs1_chunk(&stream_header_for_payload(payload), &chunk).unwrap();
-
-        assert_eq!(validated.payload_byte_length, payload.len());
-    }
-
-    #[test]
-    fn rejects_brs1_chunk_crc_mismatch() {
-        let payload = b"payload";
-        let mut chunk = serialized_chunk(payload);
-        let last = chunk.len() - 1;
-        chunk[last] ^= 1;
-
-        assert!(validate_brs1_chunk(&stream_header_for_payload(payload), &chunk).is_err());
-    }
-
-    #[test]
-    fn rejects_brs1_chunk_trailing_bytes() {
-        let payload = b"payload";
-        let mut chunk = serialized_chunk(payload);
-        chunk.push(0);
-
-        assert!(validate_brs1_chunk(&stream_header_for_payload(payload), &chunk).is_err());
     }
 
     #[test]
