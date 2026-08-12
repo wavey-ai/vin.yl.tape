@@ -8,10 +8,14 @@ use record_descriptor::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "http")]
+use std::collections::HashMap;
 
 pub const DEFAULT_API_BASE_URL: &str = "https://yl.vin/api/play/tape";
 pub const CACHE_BATCH_FORMAT: &str = "bitneedle-player-cache-batch-v1";
 pub const CACHE_BATCH_JSON_FORMAT: &str = "vin-yl-tape-batch-v2";
+pub const CACHE_BATCH_STREAM_CONTENT_TYPE: &str =
+    "application/vnd.bitneedle.player-cache-stream+binary";
 pub const CACHE_STORE_NAME: &str = "opus-chunks";
 pub const CACHE_KEY_PREFIX: &str = "ecdc-opus";
 pub const CACHE_KEY_DOMAIN: &str = "bitneedle.opus-chunk-cache-key.v1";
@@ -266,18 +270,32 @@ impl TapeClient {
     }
 
     pub async fn read_ecdc_opus(&self, input: EcdcOpusReadInput<'_>) -> Result<Option<Vec<u8>>> {
-        let descriptor: RecordDescriptor = serde_json::from_str(input.record_descriptor_json)
-            .context("the record descriptor JSON is invalid")?;
-        descriptor
-            .validate_cache_encryption()
-            .context("the record cache-encryption descriptor is invalid")?;
-        let key = ecdc_opus_cache_key(&descriptor, input.source_payload)?;
-        let request = batch_read_request(vec![key.clone()])?;
+        self.read_ecdc_opus_entries(&[input])
+            .await?
+            .into_iter()
+            .next()
+            .context("the tape lookup returned no result")
+    }
+
+    pub async fn read_ecdc_opus_entries(
+        &self,
+        inputs: &[EcdcOpusReadInput<'_>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut keys = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let descriptor: RecordDescriptor = serde_json::from_str(input.record_descriptor_json)
+                .context("the record descriptor JSON is invalid")?;
+            descriptor
+                .validate_cache_encryption()
+                .context("the record cache-encryption descriptor is invalid")?;
+            keys.push(ecdc_opus_cache_key(&descriptor, input.source_payload)?);
+        }
+        let request = batch_read_request(keys.clone())?;
         let url = format!("{}/batch", self.api_base_url);
         let response = self
             .http
             .post(&url)
-            .header("Accept", "application/json")
+            .header("Accept", CACHE_BATCH_STREAM_CONTENT_TYPE)
             .json(&request)
             .send()
             .await
@@ -285,46 +303,36 @@ impl TapeClient {
         if !response.status().is_success() {
             bail!("the tape lookup failed with status {}", response.status());
         }
-        let response: TapeBatchReadResponse = response
-            .json()
-            .await
-            .context("the tape lookup response is invalid")?;
-        if response.format != CACHE_BATCH_JSON_FORMAT || response.results.len() != 1 {
-            bail!("the tape lookup response format is invalid");
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if !content_type.contains(CACHE_BATCH_STREAM_CONTENT_TYPE) {
+            bail!("the tape lookup returned an unsupported content type");
         }
-        let result = &response.results[0];
-        if result.key != key {
-            bail!("the tape lookup returned the wrong key");
-        }
-        if !result.hit {
-            return Ok(None);
-        }
-        let direct_get_url = result
-            .direct_get_url
-            .as_deref()
-            .context("the tape lookup did not return a direct read URL")?;
-        let envelope = self
-            .http
-            .get(direct_get_url)
-            .send()
-            .await
-            .context("the tape object download failed")?;
-        if !envelope.status().is_success() {
-            bail!(
-                "the tape object download failed with status {}",
-                envelope.status()
-            );
-        }
-        let envelope = envelope
+        let bytes = response
             .bytes()
             .await
-            .context("the tape object body is invalid")?;
-        decrypt_ecdc_opus_entry(
-            input.record_descriptor_json,
-            input.source_payload,
-            &envelope,
-        )
-        .map(Some)
+            .context("the tape lookup body is invalid")?;
+        let envelopes = parse_batch_stream(&bytes)?;
+        inputs
+            .iter()
+            .zip(keys)
+            .map(|(input, key)| {
+                envelopes
+                    .get(&key)
+                    .map(|envelope| {
+                        decrypt_ecdc_opus_entry(
+                            input.record_descriptor_json,
+                            input.source_payload,
+                            envelope,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect()
     }
 
     async fn upload_batch(&self, writes: Vec<PreparedTapeWrite>) -> Result<usize> {
@@ -383,6 +391,47 @@ impl TapeClient {
             last_error.unwrap_or_else(|| "unknown transport error".to_string())
         )
     }
+}
+
+#[cfg(feature = "http")]
+fn parse_batch_stream(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
+    let mut cursor = 0usize;
+    let mut entries = HashMap::new();
+    while cursor < bytes.len() {
+        let header_end = cursor
+            .checked_add(6)
+            .filter(|end| *end <= bytes.len())
+            .context("the tape stream frame is truncated")?;
+        let payload_length = u32::from_be_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .expect("four-byte slice"),
+        ) as usize;
+        let key_length = u16::from_be_bytes(
+            bytes[cursor + 4..header_end]
+                .try_into()
+                .expect("two-byte slice"),
+        ) as usize;
+        let key_end = header_end
+            .checked_add(key_length)
+            .filter(|end| *end <= bytes.len())
+            .context("the tape stream key is truncated")?;
+        let payload_end = key_end
+            .checked_add(payload_length)
+            .filter(|end| *end <= bytes.len())
+            .context("the tape stream payload is truncated")?;
+        let key = std::str::from_utf8(&bytes[header_end..key_end])
+            .context("the tape stream key is invalid")?
+            .to_string();
+        if entries
+            .insert(key, bytes[key_end..payload_end].to_vec())
+            .is_some()
+        {
+            bail!("the tape stream contains a duplicate key");
+        }
+        cursor = payload_end;
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -450,6 +499,21 @@ mod tests {
             ecdc_opus_cache_key(&descriptor, b"source").expect("descriptor key"),
             ecdc_opus_cache_key_from_binding_hash(b"source", &binding).expect("binding key")
         );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn batch_stream_parser_preserves_keys_and_envelopes() {
+        let key = "ecdc-opus/0123456789abcdef";
+        let payload = b"BCE1 encrypted bytes";
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        stream.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        stream.extend_from_slice(key.as_bytes());
+        stream.extend_from_slice(payload);
+
+        let parsed = parse_batch_stream(&stream).expect("parsed stream");
+        assert_eq!(parsed.get(key).map(Vec::as_slice), Some(payload.as_slice()));
     }
 
     #[test]
