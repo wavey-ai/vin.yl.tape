@@ -507,6 +507,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_key_matches_cross_platform_vector() {
+        let binding = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            ecdc_opus_cache_key_from_binding_hash(b"abc", binding).expect("cache key"),
+            "ecdc-opus/c4b9ba59bcd70b100755f3adbdabc46a13e7e4b6500e807287c8780cd423b1f2"
+        );
+    }
+
     #[cfg(feature = "http")]
     #[test]
     fn batch_stream_parser_preserves_keys_and_envelopes() {
