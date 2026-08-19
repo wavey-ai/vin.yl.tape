@@ -27,4 +27,4 @@ urlencoding = "2"
 worker = "0.8.3"
 
 [dev-dependencies]
-ureq = "2"
+ureq = { version = "2", features = ["json"] }

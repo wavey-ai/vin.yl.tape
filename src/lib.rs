@@ -8,37 +8,42 @@ use sha2::{Digest, Sha256};
 #[cfg(target_arch = "wasm32")]
 use std::collections::HashMap;
 
-const TAPE_API_PREFIX: &str = "/api/play/tape";
-const SOURCE_AUDIO_API_PREFIX: &str = "/api/bitneedle-source-audio";
+/// The product owns the path. Everything the store answers is under it.
+const TAPE_PREFIX: &str = "/tape";
 const CACHE_API_JSON_CONTENT_TYPE: &str = "application/json";
-const CACHE_API_HASH_LENGTH: usize = 64;
 const TAPE_API_DEFAULT_VERSION: &str = "v1";
 const TAPE_API_MAX_VERSION_LENGTH: usize = 32;
 const CACHE_API_R2_BINDING: &str = "CACHE_BUCKET";
 
-const CACHE_API_BATCH_FORMAT: &str = "bitneedle-player-cache-batch-v1";
-const CACHE_API_BATCH_STREAM_CONTENT_TYPE: &str =
-    "application/vnd.bitneedle.player-cache-stream+binary";
-// The stored content object is the full BCE1 encrypted envelope, not a bare
-// Opus packet stream — the inner codec identity travels in the envelope's
+/// The protocol, in three strings.
+///
+/// A lookup is answered without reading R2 at all: the envelope lives under a
+/// key the caller can derive for itself, so every answer is a signature over
+/// a string. The client fetches the object from storage and reads a 404 as
+/// the miss. That is the whole read path — there is no pointer to resolve, no
+/// second object to confirm, and nothing for the Worker to stream.
+const CACHE_API_LOOKUP_FORMAT: &str = "vin-yl-tape-lookup-v3";
+const CACHE_API_WRITE_FORMAT: &str = "vin-yl-tape-write-v3";
+/// A store request asks for signed uploads instead of signed reads. It only
+/// answers for the content-addressed namespace: a `blob` key *is* the SHA-256
+/// of the bytes, so the worst a bad upload can do is occupy a name nothing
+/// will ever ask for. Chunk-cache writes keep the proxied path, where the
+/// record-header proof is worth the round trip.
+const CACHE_API_STORE_FORMAT: &str = "vin-yl-tape-store-v3";
+/// The content-addressed namespace. Every version of a recording lives here —
+/// the master, the lossless copy, the Opus, the stems — addressed only by
+/// what it contains. Who owns what is a question for a layer above this one.
+const CACHE_API_BLOB_PREFIX: &str = "blob";
+const CACHE_API_RESPONSE_FORMAT: &str = "vin-yl-tape-batch-v3";
+// The stored object is the full BCE1 encrypted envelope, not a bare Opus
+// packet stream — the inner codec identity travels in the envelope's
 // AAD-bound cache-encryption context, not in this content type.
 const CACHE_API_OPUS_CONTENT_TYPE: &str = "application/vnd.bitneedle.bce1+binary";
-// Two-tier addressing for the encrypted opus-chunks store: the caller's `key`
-// (a pre-decode, record-scoped lookup key — see playerEcdcOpusChunkCacheKey in
-// bitneedle-decoded-ecdc-opus-cache.js) is never itself the storage path.
-// Instead it resolves through a small pointer object to the actual content
-// blob, which is addressed by sha256 of the BCE1 envelope bytes. This keeps
-// the client-visible protocol unchanged (still asks/writes by lookup key)
-// while making the persisted object genuinely content-addressed: a
-// deterministic nonce (see derive_cache_nonce in record-descriptor) means the
-// same (record, plaintext, context) always produces the same envelope bytes,
-// so the content object's write-once skip-if-exists check is actually safe.
-// Reads only return small JSON (contentHash + a signed R2 URL), so a much
-// larger batch is cheap. Writes carry the full chunk payload bytes in the
-// request body, so that cap stays conservative.
+// Reads carry a signed URL per key and cost no I/O, so the batch can be
+// large. Writes carry the chunk payloads themselves, so that cap stays
+// conservative.
 const CACHE_API_MAX_READ_BATCH_ENTRIES: usize = 256;
 const CACHE_API_MAX_WRITE_BATCH_ENTRIES: usize = 32;
-const CACHE_API_BATCH_JSON_FORMAT: &str = "vin-yl-tape-batch-v2";
 const CACHE_API_PRESIGN_EXPIRES_SECONDS: u32 = 300;
 // Per-chunk limits: 2s × 128kbps stereo with 4× headroom.
 const CACHE_API_MAX_OPUS_PAYLOAD_BYTES: usize = 131_072; // 128 KB
@@ -46,34 +51,39 @@ const CACHE_API_MAX_BCE1_ENVELOPE_BYTES: usize =
     record_descriptor::CacheEncryptionEnvelope::HEADER_LENGTH
         + CACHE_API_MAX_OPUS_PAYLOAD_BYTES
         + record_descriptor::CACHE_ENCRYPTION_TAG_LENGTH;
-const SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES: usize = 256 * 1024;
-const SOURCE_AUDIO_UPLOAD_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
-const SOURCE_AUDIO_OBJECT_NAMESPACE: &str = "source-audio/v1/objects";
 
 #[derive(Debug, Deserialize)]
 struct BatchReadRequest {
     #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
     keys: Vec<String>,
 }
 
+/// What a signed request answers with: one URL per key, for the action that
+/// was asked for. There is no `hit` — the Worker did not look, and saying so
+/// would be a guess. A key it cannot sign comes back without a URL, which is
+/// the only miss this response can state honestly.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BatchReadKeyResult {
+struct PresignedReadKeyResult {
     key: String,
-    hit: bool,
-    content_hash: Option<String>,
-    direct_get_url: Option<String>,
-    direct_get_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct BatchReadResponse {
+struct PresignedReadResponse {
     format: String,
-    results: Vec<BatchReadKeyResult>,
+    results: Vec<PresignedReadKeyResult>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BatchWriteRequest {
+    #[serde(default)]
+    format: Option<String>,
     #[serde(default)]
     writes: Vec<BatchWriteEntry>,
 }
@@ -97,25 +107,6 @@ struct BatchWriteResponse {
     results: Vec<BatchWriteResult>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SourceAudioChunkManifest {
-    index: usize,
-    byte_length: usize,
-    sha256: String,
-    object_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SourceAudioUploadState {
-    object_id: String,
-    object_hash: String,
-    sealed: bool,
-    metadata: serde_json::Value,
-    chunks: Vec<SourceAudioChunkManifest>,
-}
-
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
@@ -125,22 +116,17 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
     console_error_panic_hook::set_once();
 
     let url = request.url()?;
-    if !is_cache_api_path(url.path()) && !is_source_audio_api_path(url.path()) {
+    if !is_tape_path(url.path()) {
         return Response::ok("Not found\n").map(|response| response.with_status(404));
     }
 
     let origin = request.headers().get("Origin").ok().flatten();
-
-    let result = if is_source_audio_api_path(url.path()) {
-        handle_source_audio_api_request(request, url, env, origin.as_deref()).await
-    } else {
-        handle_cache_api_request(request, url, env, origin.as_deref()).await
-    };
+    let result = handle_cache_api_request(request, url, env, origin.as_deref()).await;
 
     match result {
         Ok(response) => Ok(response),
         Err(error) => {
-            console_warn!("[play-cache] request failed: {}", error);
+            console_warn!("[tape] request failed: {}", error);
             cache_api_json(
                 &serde_json::json!({ "error": "Cache API request failed" }),
                 500,
@@ -150,21 +136,12 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
     }
 }
 
-fn is_cache_api_path(pathname: &str) -> bool {
-    pathname == TAPE_API_PREFIX || pathname.starts_with(&format!("{TAPE_API_PREFIX}/"))
-}
-
-fn is_source_audio_api_path(pathname: &str) -> bool {
-    pathname == SOURCE_AUDIO_API_PREFIX
-        || pathname.starts_with(&format!("{SOURCE_AUDIO_API_PREFIX}/"))
+fn is_tape_path(pathname: &str) -> bool {
+    pathname == TAPE_PREFIX || pathname.starts_with(&format!("{TAPE_PREFIX}/"))
 }
 
 fn cache_api_relative_path(pathname: &str) -> Option<&str> {
-    pathname.strip_prefix(TAPE_API_PREFIX)
-}
-
-fn source_audio_api_relative_path(pathname: &str) -> Option<&str> {
-    pathname.strip_prefix(SOURCE_AUDIO_API_PREFIX)
+    pathname.strip_prefix(TAPE_PREFIX)
 }
 
 fn normalize_tape_version(version: &str) -> Option<String> {
@@ -180,341 +157,6 @@ fn normalize_tape_version(version: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn handle_cache_api_request(
-    request: Request,
-    url: url::Url,
-    env: Env,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    if request.method() == Method::Options {
-        return with_cache_api_headers(Response::empty()?.with_status(204), origin);
-    }
-
-    let relative_path = cache_api_relative_path(url.path())
-        .unwrap_or("")
-        .trim_start_matches('/');
-
-    if relative_path == "batch" {
-        if request.method() != Method::Post {
-            return cache_api_json(
-                &serde_json::json!({ "error": "Method not allowed" }),
-                405,
-                origin,
-            );
-        }
-        return handle_batch_request(request, &env, origin).await;
-    }
-
-    cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn handle_source_audio_api_request(
-    mut request: Request,
-    url: url::Url,
-    env: Env,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    if request.method() == Method::Options {
-        return with_cache_api_headers(Response::empty()?.with_status(204), origin);
-    }
-
-    let relative_path = source_audio_api_relative_path(url.path())
-        .unwrap_or("")
-        .trim_start_matches('/');
-    let Some((object_id, action)) = parse_source_audio_object_action(relative_path) else {
-        return cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin);
-    };
-
-    match (request.method(), action.as_str()) {
-        (Method::Post, "uploads") => {
-            source_audio_create_upload(&mut request, &env, &object_id, origin).await
-        }
-        (Method::Post, "chunks") => {
-            source_audio_append_chunk(&mut request, &env, &object_id, origin).await
-        }
-        (Method::Post, "seal") => source_audio_seal_upload(&env, &object_id, origin).await,
-        (Method::Get, "manifest") => source_audio_read_manifest(&env, &object_id, origin).await,
-        _ => cache_api_json(
-            &serde_json::json!({ "error": "Method not allowed" }),
-            405,
-            origin,
-        ),
-    }
-}
-
-fn parse_source_audio_object_action(relative_path: &str) -> Option<(String, String)> {
-    let parts = relative_path.split('/').collect::<Vec<_>>();
-    if parts.len() != 3 || parts[0] != "objects" || parts[1].is_empty() || parts[2].is_empty() {
-        return None;
-    }
-    let object_id = urlencoding::decode(parts[1]).ok()?.into_owned();
-    if !is_valid_source_audio_object_id(&object_id) {
-        return None;
-    }
-    Some((object_id, parts[2].to_ascii_lowercase()))
-}
-
-fn is_valid_source_audio_object_id(object_id: &str) -> bool {
-    !object_id.is_empty()
-        && object_id.len() <= 128
-        && object_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
-}
-
-fn source_audio_object_hash(object_id: &str) -> String {
-    sha256_hex(object_id.as_bytes())
-}
-
-fn source_audio_state_key(object_hash: &str) -> String {
-    format!("{SOURCE_AUDIO_OBJECT_NAMESPACE}/{object_hash}/upload-state.json")
-}
-
-fn source_audio_manifest_key(object_hash: &str) -> String {
-    format!("{SOURCE_AUDIO_OBJECT_NAMESPACE}/{object_hash}/manifest.json")
-}
-
-fn source_audio_chunk_key(object_hash: &str, index: usize, chunk_hash: &str) -> String {
-    format!("{SOURCE_AUDIO_OBJECT_NAMESPACE}/{object_hash}/chunks/{index:06}-{chunk_hash}.bce1")
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn source_audio_read_state(
-    env: &Env,
-    object_hash: &str,
-) -> worker::Result<Option<SourceAudioUploadState>> {
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let Some(object) = bucket
-        .get(&source_audio_state_key(object_hash))
-        .execute()
-        .await?
-    else {
-        return Ok(None);
-    };
-    let Some(body) = object.body() else {
-        return Ok(None);
-    };
-    let bytes = body.bytes().await?;
-    if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
-        return Ok(None);
-    }
-    Ok(serde_json::from_slice(&bytes).ok())
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn source_audio_write_state(env: &Env, state: &SourceAudioUploadState) -> worker::Result<()> {
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let bytes = serde_json::to_vec(state)?;
-    if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
-        return Err(worker::Error::RustError(
-            "source-audio upload state is too large".to_string(),
-        ));
-    }
-    let mut http_metadata = HttpMetadata::default();
-    http_metadata.content_type = Some(CACHE_API_JSON_CONTENT_TYPE.to_string());
-    bucket
-        .put(&source_audio_state_key(&state.object_hash), bytes)
-        .http_metadata(http_metadata)
-        .execute()
-        .await?;
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn source_audio_create_upload(
-    request: &mut Request,
-    env: &Env,
-    object_id: &str,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let bytes = request.bytes().await?;
-    if bytes.len() > SOURCE_AUDIO_UPLOAD_STATE_MAX_BYTES {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Upload metadata is too large" }),
-            413,
-            origin,
-        );
-    }
-    let metadata = if bytes.is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
-    };
-    let object_hash = source_audio_object_hash(object_id);
-    let state = SourceAudioUploadState {
-        object_id: object_id.to_string(),
-        object_hash: object_hash.clone(),
-        sealed: false,
-        metadata,
-        chunks: Vec::new(),
-    };
-    source_audio_write_state(env, &state).await?;
-    cache_api_json(
-        &serde_json::json!({
-            "ok": true,
-            "objectId": object_id,
-            "objectHash": object_hash,
-            "chunkCount": 0
-        }),
-        201,
-        origin,
-    )
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn source_audio_append_chunk(
-    request: &mut Request,
-    env: &Env,
-    object_id: &str,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let object_hash = source_audio_object_hash(object_id);
-    let Some(mut state) = source_audio_read_state(env, &object_hash).await? else {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Upload has not been created" }),
-            404,
-            origin,
-        );
-    };
-    if state.sealed {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Upload is already sealed" }),
-            409,
-            origin,
-        );
-    }
-    let bytes = request.bytes().await?;
-    if bytes.is_empty() || bytes.len() > SOURCE_AUDIO_UPLOAD_CHUNK_MAX_BYTES {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Invalid source-audio chunk size" }),
-            400,
-            origin,
-        );
-    }
-    let chunk_hash = sha256_hex(&bytes);
-    let index = state.chunks.len();
-    let object_key = source_audio_chunk_key(&object_hash, index, &chunk_hash);
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let mut metadata = HashMap::new();
-    metadata.insert("objectHash".to_string(), object_hash.clone());
-    metadata.insert("chunkIndex".to_string(), index.to_string());
-    metadata.insert("sha256".to_string(), chunk_hash.clone());
-    let mut http_metadata = HttpMetadata::default();
-    http_metadata.content_type = Some(CACHE_API_OPUS_CONTENT_TYPE.to_string());
-    bucket
-        .put(&object_key, bytes.clone())
-        .custom_metadata(metadata)
-        .http_metadata(http_metadata)
-        .execute()
-        .await?;
-    let chunk = SourceAudioChunkManifest {
-        index,
-        byte_length: bytes.len(),
-        sha256: chunk_hash,
-        object_key,
-    };
-    state.chunks.push(chunk.clone());
-    source_audio_write_state(env, &state).await?;
-    cache_api_json(
-        &serde_json::json!({
-            "ok": true,
-            "objectId": object_id,
-            "objectHash": object_hash,
-            "chunk": chunk
-        }),
-        201,
-        origin,
-    )
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn source_audio_seal_upload(
-    env: &Env,
-    object_id: &str,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let object_hash = source_audio_object_hash(object_id);
-    let Some(mut state) = source_audio_read_state(env, &object_hash).await? else {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Upload has not been created" }),
-            404,
-            origin,
-        );
-    };
-    if state.chunks.is_empty() {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Upload has no chunks" }),
-            400,
-            origin,
-        );
-    }
-    state.sealed = true;
-    source_audio_write_state(env, &state).await?;
-    let manifest = serde_json::json!({
-        "ok": true,
-        "format": "bitneedle-source-audio-object-v1",
-        "objectId": state.object_id,
-        "objectHash": state.object_hash,
-        "sealed": true,
-        "metadata": state.metadata,
-        "chunkCount": state.chunks.len(),
-        "byteLength": state.chunks.iter().map(|chunk| chunk.byte_length).sum::<usize>(),
-        "chunks": state.chunks,
-    });
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let bytes = serde_json::to_vec(&manifest)?;
-    let mut http_metadata = HttpMetadata::default();
-    http_metadata.content_type = Some(CACHE_API_JSON_CONTENT_TYPE.to_string());
-    bucket
-        .put(&source_audio_manifest_key(&object_hash), bytes)
-        .http_metadata(http_metadata)
-        .execute()
-        .await?;
-    cache_api_json(&manifest, 200, origin)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn source_audio_read_manifest(
-    env: &Env,
-    object_id: &str,
-    origin: Option<&str>,
-) -> worker::Result<Response> {
-    let object_hash = source_audio_object_hash(object_id);
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let Some(object) = bucket
-        .get(&source_audio_manifest_key(&object_hash))
-        .execute()
-        .await?
-    else {
-        return cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin);
-    };
-    let Some(body) = object.body() else {
-        return cache_api_json(
-            &serde_json::json!({ "error": "Manifest body unavailable" }),
-            500,
-            origin,
-        );
-    };
-    let headers = Headers::new();
-    headers.set("Content-Type", CACHE_API_JSON_CONTENT_TYPE)?;
-    headers.set("Cache-Control", "no-store")?;
-    with_cache_api_headers(
-        Response::from_bytes(body.bytes().await?)?
-            .with_status(200)
-            .with_headers(headers),
-        origin,
-    )
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == CACHE_API_HASH_LENGTH
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_opus_proof(proof: &serde_json::Value, payload: &[u8]) -> Result<(), &'static str> {
@@ -592,10 +234,9 @@ fn validate_bce1_envelope(payload: &[u8]) -> Result<(), &'static str> {
 const CACHE_API_KEY_PREFIX_MAX_LENGTH: usize = 32;
 
 // Keys look like `<prefix>/<16-or-64-hex>[:version]`, e.g.
-// `ecdc-opus/ab12...:v1`. The prefix names the object type (today only
-// `ecdc-opus` is produced) and is carried straight through into the R2
-// object path so objects stay listable/debuggable per type, rather than
-// being folded invisibly into the hash.
+// `ecdc-opus/ab12...:v1` or `blob/9f3c...`. The prefix names the namespace
+// and is carried straight through into the object path, so objects stay
+// listable per type rather than folded invisibly into a hash.
 fn parse_batch_cache_key(key: &str) -> Option<(String, String, String)> {
     let trimmed = key.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -623,24 +264,6 @@ fn parse_batch_cache_key(key: &str) -> Option<(String, String, String)> {
     }
     let version = normalize_tape_version(version_part)?;
     Some((prefix.to_string(), lookup_key.to_string(), version))
-}
-
-fn opus_pointer_object_key(prefix: &str, lookup_key: &str, version: &str) -> String {
-    format!(
-        "{version}/lookup/{prefix}/{}/{}/{}",
-        &lookup_key[0..2],
-        &lookup_key[2..4],
-        lookup_key
-    )
-}
-
-fn opus_content_object_key(prefix: &str, content_hash_hex: &str, version: &str) -> String {
-    format!(
-        "{version}/sha256/{prefix}/{}/{}/{}",
-        &content_hash_hex[0..2],
-        &content_hash_hex[2..4],
-        content_hash_hex
-    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -717,9 +340,45 @@ fn uri_encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// Where an object lives. One layout for everything the store holds: the
+/// namespace it was asked for, sharded by the first two byte-pairs of the
+/// key. `ecdc-opus` keys are derived from a record and address a chunk of
+/// decoded audio; `blob` keys are the SHA-256 of the bytes themselves, which
+/// is how every other version of a recording is addressed — masters, stems,
+/// the lossless copy. Same store, one address space.
+fn tape_object_key(prefix: &str, key: &str, version: &str) -> String {
+    format!(
+        "{version}/{prefix}/{}/{}/{}",
+        &key[0..2],
+        &key[2..4],
+        key
+    )
+}
+
 #[cfg(target_arch = "wasm32")]
 fn presign_r2_get_url(
     config: &CacheApiPresignConfig,
+    object_key: &str,
+) -> Result<PresignedGetUrl, String> {
+    presign_r2_url(config, "GET", "GetObject", object_key)
+}
+
+/// A signed upload. The caller names the object by the SHA-256 of the bytes
+/// it is about to send, so bytes that do not match their name land under a
+/// name nobody will ask for. Large objects never pass through the Worker.
+#[cfg(target_arch = "wasm32")]
+fn presign_r2_put_url(
+    config: &CacheApiPresignConfig,
+    object_key: &str,
+) -> Result<PresignedGetUrl, String> {
+    presign_r2_url(config, "PUT", "PutObject", object_key)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn presign_r2_url(
+    config: &CacheApiPresignConfig,
+    method: &str,
+    action: &str,
     object_key: &str,
 ) -> Result<PresignedGetUrl, String> {
     let (date_stamp, timestamp, now_ms) = iso8601_basic_utc_now();
@@ -731,14 +390,14 @@ fn presign_r2_get_url(
     let credential_scope = format!("{date_stamp}/auto/s3/aws4_request");
     let credential = format!("{}/{}", config.access_key_id, credential_scope);
     let canonical_query = format!(
-        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential={}&X-Amz-Date={}&X-Amz-Expires={}&X-Amz-SignedHeaders=host&x-id=GetObject",
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential={}&X-Amz-Date={}&X-Amz-Expires={}&X-Amz-SignedHeaders=host&x-id={action}",
         urlencoding::encode(&credential),
         timestamp,
         config.expires_seconds,
     );
     let canonical_headers = format!("host:{host}\n");
     let canonical_request = format!(
-        "GET\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
+        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{timestamp}\n{credential_scope}\n{}",
@@ -765,21 +424,40 @@ fn presign_r2_get_url(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn handle_cache_api_request(
+    request: Request,
+    url: url::Url,
+    env: Env,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    if request.method() == Method::Options {
+        return with_cache_api_headers(Response::empty()?.with_status(204), origin);
+    }
+
+    let relative_path = cache_api_relative_path(url.path())
+        .unwrap_or("")
+        .trim_start_matches('/');
+
+    if relative_path == "batch" {
+        if request.method() != Method::Post {
+            return cache_api_json(
+                &serde_json::json!({ "error": "Method not allowed" }),
+                405,
+                origin,
+            );
+        }
+        return handle_batch_request(request, &env, origin).await;
+    }
+
+    cache_api_json(&serde_json::json!({ "error": "Not found" }), 404, origin)
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn handle_batch_request(
     mut request: Request,
     env: &Env,
     origin: Option<&str>,
 ) -> worker::Result<Response> {
-    let accept_header = request
-        .headers()
-        .get("Accept")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let prefer_stream_response = accept_header
-        .split(',')
-        .map(|part| part.trim())
-        .any(|part| part == CACHE_API_BATCH_STREAM_CONTENT_TYPE || part == "*/*");
     let body_bytes = request.bytes().await?;
     let raw: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -815,142 +493,93 @@ async fn handle_batch_request(
                 );
             }
         };
-        handle_batch_read(req, env, origin, prefer_stream_response).await
+        handle_batch_read(&req, env, origin)
     }
 }
 
+/// The whole batch, answered without a single R2 call.
+///
+/// Every key becomes a signature over a derived object key, which is pure
+/// computation — the reason the batch ceiling can be 256 and still finish
+/// inside one round trip. It is also the only thing in this Worker that
+/// spends real CPU, so it is what the 10 ms budget is actually spent on.
 #[cfg(target_arch = "wasm32")]
-async fn handle_batch_read(
-    req: BatchReadRequest,
+fn handle_batch_read(
+    req: &BatchReadRequest,
     env: &Env,
     origin: Option<&str>,
-    prefer_stream_response: bool,
 ) -> worker::Result<Response> {
-    let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let presign_config = cache_api_presign_config(env).ok();
-    let mut frame_buf: Vec<u8> = Vec::new();
-    let mut keys: Vec<BatchReadKeyResult> = Vec::new();
+    let store = match req.format.as_deref() {
+        Some(CACHE_API_LOOKUP_FORMAT) => false,
+        Some(CACHE_API_STORE_FORMAT) => true,
+        _ => {
+            return cache_api_json(
+                &serde_json::json!({ "error": "Unsupported batch lookup format" }),
+                400,
+                origin,
+            );
+        }
+    };
+    let Ok(presign_config) = cache_api_presign_config(env) else {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Signed lookups are not configured" }),
+            503,
+            origin,
+        );
+    };
 
-    {
-        for raw_key in req.keys.iter().take(CACHE_API_MAX_READ_BATCH_ENTRIES) {
+    let results = req
+        .keys
+        .iter()
+        .take(CACHE_API_MAX_READ_BATCH_ENTRIES)
+        .map(|raw_key| {
             let Some((prefix, lookup_key, version)) = parse_batch_cache_key(raw_key) else {
-                keys.push(BatchReadKeyResult {
+                return PresignedReadKeyResult {
                     key: raw_key.trim().to_ascii_lowercase(),
-                    hit: false,
-                    content_hash: None,
-                    direct_get_url: None,
-                    direct_get_expires_at: None,
-                });
-                continue;
+                    url: None,
+                    expires_at: None,
+                };
             };
             let key = if version == TAPE_API_DEFAULT_VERSION {
                 format!("{prefix}/{lookup_key}")
             } else {
                 format!("{prefix}/{lookup_key}:{version}")
             };
-            // Resolve the caller's pre-decode lookup key to the content hash
-            // it currently points at, then fetch the actual content-addressed
-            // blob. Both hops happen server-side; the client still only ever
-            // deals in lookup keys.
-            let pointer_key = opus_pointer_object_key(&prefix, &lookup_key, &version);
-            let Some(pointer_object) = bucket.get(&pointer_key).execute().await? else {
-                keys.push(BatchReadKeyResult {
+            // Uploads are signed for the content-addressed namespace only.
+            if store && prefix != CACHE_API_BLOB_PREFIX {
+                return PresignedReadKeyResult {
                     key,
-                    hit: false,
-                    content_hash: None,
-                    direct_get_url: None,
-                    direct_get_expires_at: None,
-                });
-                continue;
-            };
-            let Some(pointer_body_handle) = pointer_object.body() else {
-                keys.push(BatchReadKeyResult {
-                    key,
-                    hit: false,
-                    content_hash: None,
-                    direct_get_url: None,
-                    direct_get_expires_at: None,
-                });
-                continue;
-            };
-            let pointer_bytes = pointer_body_handle.bytes().await?;
-            let Ok(content_hash_hex) = String::from_utf8(pointer_bytes) else {
-                keys.push(BatchReadKeyResult {
-                    key,
-                    hit: false,
-                    content_hash: None,
-                    direct_get_url: None,
-                    direct_get_expires_at: None,
-                });
-                continue;
-            };
-            if !is_sha256_hex(&content_hash_hex) {
-                keys.push(BatchReadKeyResult {
-                    key,
-                    hit: false,
-                    content_hash: None,
-                    direct_get_url: None,
-                    direct_get_expires_at: None,
-                });
-                continue;
+                    url: None,
+                    expires_at: None,
+                };
             }
-            let content_key = opus_content_object_key(&prefix, &content_hash_hex, &version);
-            let Some(object) = bucket.get(&content_key).execute().await? else {
-                keys.push(BatchReadKeyResult {
+            let object_key = tape_object_key(&prefix, &lookup_key, &version);
+            let signed = if store {
+                presign_r2_put_url(&presign_config, &object_key)
+            } else {
+                presign_r2_get_url(&presign_config, &object_key)
+            };
+            match signed {
+                Ok(signed) => PresignedReadKeyResult {
                     key,
-                    hit: false,
-                    content_hash: Some(content_hash_hex),
-                    direct_get_url: None,
-                    direct_get_expires_at: None,
-                });
-                continue;
-            };
-            let direct_get = presign_config
-                .as_ref()
-                .and_then(|config| presign_r2_get_url(config, &content_key).ok());
-            keys.push(BatchReadKeyResult {
-                key: key.clone(),
-                hit: true,
-                content_hash: Some(content_hash_hex.clone()),
-                direct_get_url: direct_get.as_ref().map(|value| value.url.clone()),
-                direct_get_expires_at: direct_get.as_ref().map(|value| value.expires_at.clone()),
-            });
-            if !prefer_stream_response {
-                continue;
+                    url: Some(signed.url),
+                    expires_at: Some(signed.expires_at),
+                },
+                Err(_) => PresignedReadKeyResult {
+                    key,
+                    url: None,
+                    expires_at: None,
+                },
             }
-            let Some(body_handle) = object.body() else {
-                continue;
-            };
-            let payload = body_handle.bytes().await?;
-            if payload.is_empty() {
-                continue;
-            }
-            let key_bytes = key.as_bytes();
-            frame_buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            frame_buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-            frame_buf.extend_from_slice(key_bytes);
-            frame_buf.extend_from_slice(&payload);
-        }
-    }
+        })
+        .collect::<Vec<_>>();
 
-    if !prefer_stream_response {
-        return cache_api_json(
-            &BatchReadResponse {
-                format: CACHE_API_BATCH_JSON_FORMAT.to_string(),
-                results: keys,
-            },
-            200,
-            origin,
-        );
-    }
-
-    let headers = Headers::new();
-    headers.set("Content-Type", CACHE_API_BATCH_STREAM_CONTENT_TYPE)?;
-    headers.set("Cache-Control", "no-store")?;
-    with_cache_api_headers(
-        Response::from_bytes(frame_buf)?
-            .with_status(200)
-            .with_headers(headers),
+    cache_api_json(
+        &PresignedReadResponse {
+            format: CACHE_API_RESPONSE_FORMAT.to_string(),
+            results,
+        },
+        200,
         origin,
     )
 }
@@ -961,12 +590,18 @@ async fn handle_batch_write(
     env: &Env,
     origin: Option<&str>,
 ) -> worker::Result<Response> {
+    if req.format.as_deref() != Some(CACHE_API_WRITE_FORMAT) {
+        return cache_api_json(
+            &serde_json::json!({ "error": "Unsupported batch write format" }),
+            400,
+            origin,
+        );
+    }
     let bucket = env.bucket(CACHE_API_R2_BINDING)?;
 
-    // Entries land concurrently: each write is up to three R2 round
-    // trips, and running thirty-two of them in a line was the 20-second
-    // sync timeout. Anything past the cap answers stored:false instead
-    // of being silently dropped, so the client knows to resend.
+    // Entries land concurrently: running thirty-two writes in a line was the
+    // 20-second sync timeout. Anything past the cap answers stored:false
+    // instead of being silently dropped, so the client knows to resend.
     let capped = req.writes.len().min(CACHE_API_MAX_WRITE_BATCH_ENTRIES);
     let mut results = futures_util::future::join_all(
         req.writes[..capped]
@@ -984,7 +619,7 @@ async fn handle_batch_write(
 
     cache_api_json(
         &BatchWriteResponse {
-            format: CACHE_API_BATCH_FORMAT.to_string(),
+            format: CACHE_API_RESPONSE_FORMAT.to_string(),
             results,
         },
         200,
@@ -997,83 +632,67 @@ async fn write_batch_entry(
     bucket: &worker::Bucket,
     entry: &BatchWriteEntry,
 ) -> worker::Result<BatchWriteResult> {
-        let Some((prefix, lookup_key, version)) = parse_batch_cache_key(&entry.key) else {
-            return Ok(BatchWriteResult { stored: false });
-        };
+    let Some((prefix, lookup_key, version)) = parse_batch_cache_key(&entry.key) else {
+        return Ok(BatchWriteResult { stored: false });
+    };
 
-        // Decode payload first so the proof's bodyByteLength can be verified against it.
-        let payload = general_purpose::STANDARD
-            .decode(&entry.payload_base64)
-            .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&entry.payload_base64))
-            .or_else(|_| general_purpose::URL_SAFE.decode(&entry.payload_base64));
-        let payload = match payload {
-            Ok(b) => b,
-            Err(_) => {
-                return Ok(BatchWriteResult { stored: false });
-            }
-        };
-
-        let envelope_valid = is_bce1_envelope(&payload);
-        let payload_valid = envelope_valid && validate_bce1_envelope(&payload).is_ok();
-
-        if !payload_valid {
+    // Decode payload first so the proof's bodyByteLength can be verified against it.
+    let payload = general_purpose::STANDARD
+        .decode(&entry.payload_base64)
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&entry.payload_base64))
+        .or_else(|_| general_purpose::URL_SAFE.decode(&entry.payload_base64));
+    let payload = match payload {
+        Ok(b) => b,
+        Err(_) => {
             return Ok(BatchWriteResult { stored: false });
         }
+    };
 
-        // Full proof guard: header decode, chunkByteLength present, bodyByteLength matches.
-        let proof_valid = entry
-            .proof
-            .as_ref()
-            .is_some_and(|p| validate_opus_proof(p, &payload).is_ok());
-        if !proof_valid {
-            return Ok(BatchWriteResult { stored: false });
-        }
+    let envelope_valid = is_bce1_envelope(&payload);
+    let payload_valid = envelope_valid && validate_bce1_envelope(&payload).is_ok();
 
-        // The content object is addressed by the hash of the exact bytes
-        // being stored (the full BCE1 envelope), computed here rather than
-        // trusted from the client. A deterministic nonce (see
-        // record_descriptor::derive_cache_nonce) means the same (record,
-        // plaintext, context) always produces the same envelope bytes, so
-        // this write-once skip is now actually correct: two writers racing
-        // to store the same logical chunk always compute the same content
-        // hash and the same bytes.
-        let content_hash_hex = sha256_hex(&payload);
-        let content_key = opus_content_object_key(&prefix, &content_hash_hex, &version);
+    if !payload_valid {
+        return Ok(BatchWriteResult { stored: false });
+    }
 
-        if bucket.head(&content_key).await?.is_none() {
-            let mut metadata = HashMap::new();
-            metadata.insert("format".to_string(), "bce1".to_string());
-            metadata.insert(
-                "innerFormat".to_string(),
-                "soundkit-v2-opus-stream".to_string(),
-            );
-            metadata.insert("contentHash".to_string(), content_hash_hex.clone());
-            metadata.insert("byteLength".to_string(), payload.len().to_string());
+    // Full proof guard: header decode, chunkByteLength present, bodyByteLength matches.
+    let proof_valid = entry
+        .proof
+        .as_ref()
+        .is_some_and(|p| validate_opus_proof(p, &payload).is_ok());
+    if !proof_valid {
+        return Ok(BatchWriteResult { stored: false });
+    }
 
-            let mut http_metadata = HttpMetadata::default();
-            http_metadata.content_type = Some(CACHE_API_OPUS_CONTENT_TYPE.to_string());
+    // One object, under the key the reader derives. Overwriting is safe: a
+    // deterministic nonce (see record_descriptor::derive_cache_nonce) means
+    // the same (record, plaintext, context) always encrypts to the same
+    // bytes, so two writers racing on one chunk write the same thing. The
+    // envelope is not hashed here — nothing addresses it by content any more,
+    // and hashing a full batch was the largest CPU cost in the Worker.
+    let mut metadata = HashMap::new();
+    metadata.insert("format".to_string(), "bce1".to_string());
+    metadata.insert(
+        "innerFormat".to_string(),
+        "soundkit-v2-opus-stream".to_string(),
+    );
+    metadata.insert("byteLength".to_string(), payload.len().to_string());
 
-            bucket
-                .put(&content_key, payload)
-                .custom_metadata(metadata)
-                .http_metadata(http_metadata)
-                .execute()
-                .await?;
-        }
+    let mut http_metadata = HttpMetadata::default();
+    http_metadata.content_type = Some(CACHE_API_OPUS_CONTENT_TYPE.to_string());
 
-        // The pointer is small and always safe to overwrite: even under a
-        // write race for the same lookup key, both writers resolve to the
-        // same content hash (deterministic nonce), so the pointer converges
-        // regardless of ordering.
-        let pointer_key = opus_pointer_object_key(&prefix, &lookup_key, &version);
-        bucket
-            .put(&pointer_key, content_hash_hex.into_bytes())
-            .execute()
-            .await?;
+    bucket
+        .put(
+            &tape_object_key(&prefix, &lookup_key, &version),
+            payload,
+        )
+        .custom_metadata(metadata)
+        .http_metadata(http_metadata)
+        .execute()
+        .await?;
 
     Ok(BatchWriteResult { stored: true })
 }
-
 
 #[cfg(target_arch = "wasm32")]
 fn cache_api_json<T: Serialize>(
@@ -1172,20 +791,6 @@ fn is_private_lan_hostname(hostname: &str) -> bool {
 mod tests {
     use super::*;
 
-    const TEST_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn accepts_sha256_key() {
-        assert!(is_sha256_hex(TEST_HASH));
-    }
-
-    #[test]
-    fn rejects_uppercase_sha256_key() {
-        assert!(!is_sha256_hex(
-            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
-        ));
-    }
-
     #[test]
     fn content_hash_is_stable() {
         assert_eq!(
@@ -1195,19 +800,16 @@ mod tests {
     }
 
     #[test]
-    fn derives_sharded_pointer_key() {
+    fn derives_the_sharded_object_key() {
         let lookup_key = "0123456789abcdef";
         assert_eq!(
-            opus_pointer_object_key("ecdc-opus", lookup_key, "v1"),
-            format!("v1/lookup/ecdc-opus/01/23/{lookup_key}")
+            tape_object_key("ecdc-opus", lookup_key, "v1"),
+            format!("v1/ecdc-opus/01/23/{lookup_key}")
         );
-    }
-
-    #[test]
-    fn derives_sharded_content_key() {
+        let content_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         assert_eq!(
-            opus_content_object_key("ecdc-opus", TEST_HASH, "v1"),
-            format!("v1/sha256/ecdc-opus/01/23/{TEST_HASH}")
+            tape_object_key("blob", content_hash, "v1"),
+            format!("v1/blob/ab/cd/{content_hash}")
         );
     }
 

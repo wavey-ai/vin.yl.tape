@@ -403,6 +403,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "frame-header"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cc04ce8cfeb0860bb501c30c1fd9d1c942a90e2244f5a98ab18d5a8d8b1b2c5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,6 +525,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
 
 [[package]]
 name = "hmac"
@@ -1616,6 +1634,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]
@@ -1683,9 +1703,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "chacha20poly1305",
+ "frame-header",
  "futures-timer",
+ "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "record-descriptor",
  "reqwest",
  "serde",

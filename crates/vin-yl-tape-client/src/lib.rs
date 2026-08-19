@@ -1,4 +1,6 @@
-//! Shared client for encrypted YL.VIN tape cache entries.
+//! Shared client for the encrypted YL.VIN tape store.
+
+pub mod stream;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -9,13 +11,24 @@ use record_descriptor::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "http")]
+use futures_util::StreamExt as _;
+#[cfg(feature = "http")]
 use std::collections::{HashMap, HashSet};
 
-pub const DEFAULT_API_BASE_URL: &str = "https://yl.vin/api/play/tape";
-pub const CACHE_BATCH_FORMAT: &str = "bitneedle-player-cache-batch-v1";
-pub const CACHE_BATCH_JSON_FORMAT: &str = "vin-yl-tape-batch-v2";
-pub const CACHE_BATCH_STREAM_CONTENT_TYPE: &str =
-    "application/vnd.bitneedle.player-cache-stream+binary";
+pub const DEFAULT_API_BASE_URL: &str = "https://yl.vin/tape";
+/// The signed-lookup protocol. The Worker answers a lookup without reading
+/// R2 — every result is a signature over the object's key — and this client
+/// fetches the objects itself, in parallel, straight from storage. A key with
+/// nothing behind it answers 404, which is the miss.
+pub const CACHE_LOOKUP_FORMAT: &str = "vin-yl-tape-lookup-v3";
+pub const CACHE_WRITE_FORMAT: &str = "vin-yl-tape-write-v3";
+/// Asks for signed uploads rather than signed reads. Content-addressed blobs
+/// only: large objects go straight to storage and never cross the Worker.
+pub const CACHE_STORE_FORMAT: &str = "vin-yl-tape-store-v3";
+pub const CACHE_RESPONSE_FORMAT: &str = "vin-yl-tape-batch-v3";
+/// How many objects this client pulls from storage at once. The Worker is out
+/// of the way by this point; this is the device's own connection budget.
+pub const MAX_CONCURRENT_OBJECT_FETCHES: usize = 16;
 pub const CACHE_STORE_NAME: &str = "opus-chunks";
 pub const CACHE_KEY_PREFIX: &str = "ecdc-opus";
 pub const CACHE_KEY_DOMAIN: &str = "bitneedle.opus-chunk-cache-key.v1";
@@ -66,14 +79,26 @@ pub struct TapeBatchReadRequest {
     pub keys: Vec<String>,
 }
 
+/// What a stored recording is reached by: two strings, the second of which
+/// opens the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredStream {
+    pub manifest_key: String,
+    pub manifest_plaintext_sha256: String,
+}
+
+
+/// One key's answer under the signed-lookup protocol. There is no `hit`: the
+/// Worker did not look. A missing URL means the key itself was unreadable.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TapeBatchReadResult {
     pub key: String,
-    pub hit: bool,
-    pub content_hash: Option<String>,
-    pub direct_get_url: Option<String>,
-    pub direct_get_expires_at: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -144,7 +169,7 @@ pub fn batch_read_request(keys: Vec<String>) -> Result<TapeBatchReadRequest> {
         bail!("the tape lookup exceeds {MAX_BATCH_READS} keys");
     }
     Ok(TapeBatchReadRequest {
-        format: CACHE_BATCH_FORMAT.to_string(),
+        format: CACHE_LOOKUP_FORMAT.to_string(),
         keys,
     })
 }
@@ -223,7 +248,7 @@ pub fn batch_write_request(writes: Vec<PreparedTapeWrite>) -> Result<TapeBatchWr
         bail!("the tape batch exceeds {MAX_BATCH_WRITES} writes");
     }
     Ok(TapeBatchWriteRequest {
-        format: CACHE_BATCH_FORMAT.to_string(),
+        format: CACHE_WRITE_FORMAT.to_string(),
         writes,
     })
 }
@@ -301,7 +326,7 @@ impl TapeClient {
         let response = self
             .http
             .post(&url)
-            .header("Accept", CACHE_BATCH_STREAM_CONTENT_TYPE)
+            .header("Accept", "application/json")
             .json(&request)
             .send()
             .await
@@ -309,20 +334,43 @@ impl TapeClient {
         if !response.status().is_success() {
             bail!("the tape lookup failed with status {}", response.status());
         }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        if !content_type.contains(CACHE_BATCH_STREAM_CONTENT_TYPE) {
-            bail!("the tape lookup returned an unsupported content type");
-        }
-        let bytes = response
-            .bytes()
+        let lookup: TapeBatchReadResponse = response
+            .json()
             .await
             .context("the tape lookup body is invalid")?;
-        let envelopes = parse_batch_stream(&bytes)?;
+        if lookup.format != CACHE_RESPONSE_FORMAT {
+            bail!("the tape lookup response format is invalid");
+        }
+        let signed = lookup
+            .results
+            .into_iter()
+            .filter_map(|result| {
+                result.url.map(|url| (result.key, url))
+            })
+            .collect::<HashMap<_, _>>();
+
+        // The objects come straight out of storage, several at a time. The
+        // Worker is not in this path at all, so the only ceiling that matters
+        // is how many connections this device should hold open.
+        let wanted = keys
+            .iter()
+            .filter_map(|key| signed.get(key).map(|url| (key.clone(), url.clone())))
+            .collect::<Vec<_>>();
+        let fetched = futures_util::stream::iter(wanted.into_iter().map(|(key, url)| {
+            let http = self.http.clone();
+            async move { (key, fetch_cache_object(&http, &url).await) }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_OBJECT_FETCHES)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut envelopes: HashMap<String, Vec<u8>> = HashMap::new();
+        for (key, outcome) in fetched {
+            if let Some(envelope) = outcome? {
+                envelopes.insert(key, envelope);
+            }
+        }
+
         inputs
             .iter()
             .zip(keys)
@@ -339,6 +387,155 @@ impl TapeClient {
                     .transpose()
             })
             .collect()
+    }
+
+    /// Signed URLs for a set of keys, in one request. `store` asks for
+    /// uploads instead of reads. The Worker touches no storage either way, so
+    /// this is one round trip regardless of how many keys are asked for.
+    async fn signed_urls(&self, keys: &[String], store: bool) -> Result<HashMap<String, String>> {
+        let mut signed = HashMap::new();
+        for slab in keys.chunks(MAX_BATCH_READS) {
+            let request = TapeBatchReadRequest {
+                format: if store {
+                    CACHE_STORE_FORMAT.to_string()
+                } else {
+                    CACHE_LOOKUP_FORMAT.to_string()
+                },
+                keys: slab.to_vec(),
+            };
+            let response = self
+                .http
+                .post(&format!("{}/batch", self.api_base_url))
+                .header("Accept", "application/json")
+                .json(&request)
+                .send()
+                .await
+                .context("the tape lookup failed")?;
+            if !response.status().is_success() {
+                bail!("the tape lookup failed with status {}", response.status());
+            }
+            let lookup: TapeBatchReadResponse = response
+                .json()
+                .await
+                .context("the tape lookup body is invalid")?;
+            if lookup.format != CACHE_RESPONSE_FORMAT {
+                bail!("the tape lookup response format is invalid");
+            }
+            for result in lookup.results {
+                if let Some(url) = result.url {
+                    signed.insert(result.key, url);
+                }
+            }
+        }
+        Ok(signed)
+    }
+
+    /// Stores a SoundKit v2 recording — a master, a stem, the lossless copy,
+    /// the Opus — as sealed segments plus the manifest that orders them.
+    ///
+    /// Uploads go straight to storage on signed URLs, several at a time, so a
+    /// long master never passes through the Worker. Re-storing the same audio
+    /// writes the same bytes to the same addresses, which makes a resumed or
+    /// repeated upload harmless.
+    pub async fn store_stream(&self, stream: &[u8]) -> Result<StoredStream> {
+        self.store_sealed(crate::stream::seal_stream(stream)?).await
+    }
+
+    /// Stores something with no frames to cut on — an imported master in the
+    /// format it arrived in, an ECDC payload — under the same manifest shape.
+    /// It comes back whole rather than seekable, which is the honest limit of
+    /// audio that was never framed.
+    pub async fn store_opaque_stream(&self, bytes: &[u8], codec: &str) -> Result<StoredStream> {
+        self.store_sealed(crate::stream::seal_opaque_stream(bytes, codec)?)
+            .await
+    }
+
+    async fn store_sealed(&self, sealed: crate::stream::SealedStream) -> Result<StoredStream> {
+        let handle = StoredStream {
+            manifest_key: sealed.manifest_blob.key.clone(),
+            manifest_plaintext_sha256: sealed.manifest_blob.plaintext_sha256.clone(),
+        };
+
+        // The manifest goes last: until it is stored, nothing points at the
+        // segments, and a half-finished upload is invisible rather than
+        // broken.
+        let mut blobs = sealed.segments;
+        blobs.push(sealed.manifest_blob);
+        let keys = blobs.iter().map(|blob| blob.key.clone()).collect::<Vec<_>>();
+        let signed = self.signed_urls(&keys, true).await?;
+
+        let uploads = blobs
+            .into_iter()
+            .map(|blob| {
+                let url = signed
+                    .get(&blob.key)
+                    .cloned()
+                    .with_context(|| format!("the store refused to sign {}", blob.key))?;
+                Ok((blob, url))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        futures_util::stream::iter(uploads.into_iter().map(|(blob, url)| {
+            let http = self.http.clone();
+            async move { put_object(&http, &url, blob.bytes).await }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_OBJECT_FETCHES)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+        Ok(handle)
+    }
+
+    /// Reads a stored recording's manifest — its shape and its seek index.
+    pub async fn open_stream(
+        &self,
+        stored: &StoredStream,
+    ) -> Result<Option<crate::stream::TapeStreamManifest>> {
+        let keys = vec![stored.manifest_key.clone()];
+        let signed = self.signed_urls(&keys, false).await?;
+        let Some(url) = signed.get(&stored.manifest_key) else {
+            return Ok(None);
+        };
+        let Some(envelope) = fetch_cache_object(&self.http, url).await? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::stream::open_manifest(
+            &stored.manifest_plaintext_sha256,
+            &envelope,
+        )?))
+    }
+
+    /// Reads one segment of a stored recording, opened and ready to decode.
+    /// Playback asks for the segments the manifest says it needs and no more.
+    pub async fn read_stream_segments(
+        &self,
+        segments: &[crate::stream::TapeStreamSegment],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let keys = segments
+            .iter()
+            .map(|segment| segment.key.clone())
+            .collect::<Vec<_>>();
+        let signed = self.signed_urls(&keys, false).await?;
+
+        let fetched = futures_util::stream::iter(segments.iter().map(|segment| {
+            let http = self.http.clone();
+            let url = signed.get(&segment.key).cloned();
+            let plaintext_sha256 = segment.plaintext_sha256.clone();
+            async move {
+                let Some(url) = url else { return Ok(None) };
+                let Some(envelope) = fetch_cache_object(&http, &url).await? else {
+                    return Ok(None);
+                };
+                crate::stream::open_blob(&plaintext_sha256, &envelope).map(Some)
+            }
+        }))
+        .buffered(MAX_CONCURRENT_OBJECT_FETCHES)
+        .collect::<Vec<Result<Option<Vec<u8>>>>>()
+        .await;
+
+        fetched.into_iter().collect()
     }
 
     async fn upload_batch(&self, writes: Vec<PreparedTapeWrite>) -> Result<usize> {
@@ -361,7 +558,7 @@ impl TapeClient {
                         .json()
                         .await
                         .context("the tape batch response is invalid")?;
-                    if response.format != CACHE_BATCH_FORMAT {
+                    if response.format != CACHE_RESPONSE_FORMAT {
                         bail!("the tape batch response format is invalid");
                     }
                     if response.results.len() != expected {
@@ -400,44 +597,50 @@ impl TapeClient {
 }
 
 #[cfg(feature = "http")]
-fn parse_batch_stream(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
-    let mut cursor = 0usize;
-    let mut entries = HashMap::new();
-    while cursor < bytes.len() {
-        let header_end = cursor
-            .checked_add(6)
-            .filter(|end| *end <= bytes.len())
-            .context("the tape stream frame is truncated")?;
-        let payload_length = u32::from_be_bytes(
-            bytes[cursor..cursor + 4]
-                .try_into()
-                .expect("four-byte slice"),
-        ) as usize;
-        let key_length = u16::from_be_bytes(
-            bytes[cursor + 4..header_end]
-                .try_into()
-                .expect("two-byte slice"),
-        ) as usize;
-        let key_end = header_end
-            .checked_add(key_length)
-            .filter(|end| *end <= bytes.len())
-            .context("the tape stream key is truncated")?;
-        let payload_end = key_end
-            .checked_add(payload_length)
-            .filter(|end| *end <= bytes.len())
-            .context("the tape stream payload is truncated")?;
-        let key = std::str::from_utf8(&bytes[header_end..key_end])
-            .context("the tape stream key is invalid")?
-            .to_string();
-        if entries
-            .insert(key, bytes[key_end..payload_end].to_vec())
-            .is_some()
-        {
-            bail!("the tape stream contains a duplicate key");
-        }
-        cursor = payload_end;
+/// Puts one object into storage with a signed URL. The object is addressed
+/// by its own hash, so an upload that lands is the only thing that could have
+/// landed under that name.
+#[cfg(feature = "http")]
+async fn put_object(http: &reqwest::Client, url: &str, bytes: Vec<u8>) -> Result<()> {
+    let response = http
+        .put(url)
+        .body(bytes)
+        .send()
+        .await
+        .context("the object could not be stored")?;
+    if !response.status().is_success() {
+        bail!("the object store refused the upload: {}", response.status());
     }
-    Ok(entries)
+    Ok(())
+}
+
+/// Pulls one cached object off storage with a signed URL.
+///
+/// A 404 is the miss — nothing was ever written under that key, or it has
+/// been swept — and is not an error. Anything else is, because a signed URL
+/// that fails for another reason means the lookup itself is broken and
+/// silently re-encoding every chunk would hide that.
+#[cfg(feature = "http")]
+async fn fetch_cache_object(http: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>> {
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .context("the cached object could not be fetched")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        bail!(
+            "the cached object fetch failed with status {}",
+            response.status()
+        );
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .context("the cached object body is invalid")?;
+    Ok((!bytes.is_empty()).then(|| bytes.to_vec()))
 }
 
 #[cfg(test)]
@@ -517,19 +720,6 @@ mod tests {
     }
 
     #[cfg(feature = "http")]
-    #[test]
-    fn batch_stream_parser_preserves_keys_and_envelopes() {
-        let key = "ecdc-opus/0123456789abcdef";
-        let payload = b"BCE1 encrypted bytes";
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        stream.extend_from_slice(&(key.len() as u16).to_be_bytes());
-        stream.extend_from_slice(key.as_bytes());
-        stream.extend_from_slice(payload);
-
-        let parsed = parse_batch_stream(&stream).expect("parsed stream");
-        assert_eq!(parsed.get(key).map(Vec::as_slice), Some(payload.as_slice()));
-    }
 
     #[test]
     fn prepared_write_contains_an_encrypted_bce1_envelope() {

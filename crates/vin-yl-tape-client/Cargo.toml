@@ -8,11 +8,14 @@ repository = "https://github.com/wavey-ai/vin.yl.tape"
 
 [features]
 default = ["http"]
-http = ["dep:futures-timer", "dep:reqwest"]
+http = ["dep:futures-timer", "dep:futures-util", "dep:reqwest"]
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+frame-header = "0.2.2"
+hkdf = "0.12"
 getrandom = { version = "0.2", features = ["js"] }
 hex = "0.4"
 record-descriptor = { git = "https://github.com/wavey-ai/bitneedle.git", branch = "main" }
@@ -21,6 +24,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 futures-timer = { version = "3", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }

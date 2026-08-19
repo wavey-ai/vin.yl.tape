@@ -7,9 +7,8 @@ account_id = "c57bb20727aa3564966d2bb693abddce"
 cpu_ms = 10
 
 routes = [
-  { pattern = "yl.vin/api/play/tape*", zone_name = "yl.vin" },
-  { pattern = "yl.vin/api/bitneedle-source-audio", zone_name = "yl.vin" },
-  { pattern = "yl.vin/api/bitneedle-source-audio/*", zone_name = "yl.vin" },
+  { pattern = "yl.vin/tape", zone_name = "yl.vin" },
+  { pattern = "yl.vin/tape/*", zone_name = "yl.vin" },
 ]
 
 [[r2_buckets]]
