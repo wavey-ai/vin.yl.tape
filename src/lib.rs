@@ -962,12 +962,43 @@ async fn handle_batch_write(
     origin: Option<&str>,
 ) -> worker::Result<Response> {
     let bucket = env.bucket(CACHE_API_R2_BINDING)?;
-    let mut results: Vec<BatchWriteResult> = Vec::new();
 
-    for entry in req.writes.iter().take(CACHE_API_MAX_WRITE_BATCH_ENTRIES) {
+    // Entries land concurrently: each write is up to three R2 round
+    // trips, and running thirty-two of them in a line was the 20-second
+    // sync timeout. Anything past the cap answers stored:false instead
+    // of being silently dropped, so the client knows to resend.
+    let capped = req.writes.len().min(CACHE_API_MAX_WRITE_BATCH_ENTRIES);
+    let mut results = futures_util::future::join_all(
+        req.writes[..capped]
+            .iter()
+            .map(|entry| write_batch_entry(&bucket, entry)),
+    )
+    .await
+    .into_iter()
+    .collect::<worker::Result<Vec<_>>>()?;
+    results.extend(
+        req.writes[capped..]
+            .iter()
+            .map(|_| BatchWriteResult { stored: false }),
+    );
+
+    cache_api_json(
+        &BatchWriteResponse {
+            format: CACHE_API_BATCH_FORMAT.to_string(),
+            results,
+        },
+        200,
+        origin,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn write_batch_entry(
+    bucket: &worker::Bucket,
+    entry: &BatchWriteEntry,
+) -> worker::Result<BatchWriteResult> {
         let Some((prefix, lookup_key, version)) = parse_batch_cache_key(&entry.key) else {
-            results.push(BatchWriteResult { stored: false });
-            continue;
+            return Ok(BatchWriteResult { stored: false });
         };
 
         // Decode payload first so the proof's bodyByteLength can be verified against it.
@@ -978,8 +1009,7 @@ async fn handle_batch_write(
         let payload = match payload {
             Ok(b) => b,
             Err(_) => {
-                results.push(BatchWriteResult { stored: false });
-                continue;
+                return Ok(BatchWriteResult { stored: false });
             }
         };
 
@@ -987,8 +1017,7 @@ async fn handle_batch_write(
         let payload_valid = envelope_valid && validate_bce1_envelope(&payload).is_ok();
 
         if !payload_valid {
-            results.push(BatchWriteResult { stored: false });
-            continue;
+            return Ok(BatchWriteResult { stored: false });
         }
 
         // Full proof guard: header decode, chunkByteLength present, bodyByteLength matches.
@@ -997,8 +1026,7 @@ async fn handle_batch_write(
             .as_ref()
             .is_some_and(|p| validate_opus_proof(p, &payload).is_ok());
         if !proof_valid {
-            results.push(BatchWriteResult { stored: false });
-            continue;
+            return Ok(BatchWriteResult { stored: false });
         }
 
         // The content object is addressed by the hash of the exact bytes
@@ -1043,18 +1071,9 @@ async fn handle_batch_write(
             .execute()
             .await?;
 
-        results.push(BatchWriteResult { stored: true });
-    }
-
-    cache_api_json(
-        &BatchWriteResponse {
-            format: CACHE_API_BATCH_FORMAT.to_string(),
-            results,
-        },
-        200,
-        origin,
-    )
+    Ok(BatchWriteResult { stored: true })
 }
+
 
 #[cfg(target_arch = "wasm32")]
 fn cache_api_json<T: Serialize>(
