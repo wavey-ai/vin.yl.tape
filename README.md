@@ -133,6 +133,21 @@ holding a candidate file can confirm the store has it. Mixing a per-vault
 secret into the key derivation removes that and costs the dedupe — the
 envelope carries a version byte so that is a new version, not a migration.
 
+## Keyed blobs
+
+A keyed blob (envelope version 2) is for content that must stay private to
+the holders of a secret, for example a shared mastering link. The client
+derives the key from a 32-byte secret with HKDF-SHA256 and uses a random
+24-byte nonce for each blob. The envelope is the 8-byte header, the nonce and
+the ciphertext.
+
+- `seal_keyed_blob(secret, plaintext)` seals one blob.
+- `open_keyed_blob(secret, envelope)` opens it.
+
+The same plaintext seals to different bytes each time. Thus a keyed blob does
+not dedupe, and a person who holds a copy of the plaintext cannot find it in
+the store. The blob key is still the SHA-256 of the stored bytes.
+
 ## Client ownership
 
 Applications must use `vin-yl-tape-client` for:

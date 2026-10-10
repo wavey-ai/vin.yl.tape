@@ -51,6 +51,15 @@ pub const BLOB_NONCE_INFO: &[u8] = b"vin.yl.tape.blob-nonce.v1";
 pub const BLOB_AAD_DOMAIN: &[u8] = b"vin.yl.tape.blob-aad.v1";
 const BLOB_NONCE_LENGTH: usize = 24;
 
+/// The keyed blob envelope. Its key comes from a secret that the caller holds,
+/// and its nonce is random, so the stored bytes reveal nothing about the
+/// plaintext to anyone without the secret, including someone who holds a
+/// copy of the same file.
+pub const BLOB_ENVELOPE_VERSION_KEYED: u8 = 2;
+pub const BLOB_KEYED_KEY_INFO: &[u8] = b"vin.yl.tape.blob-keyed-key.v2";
+/// The length of the secret of a keyed blob.
+pub const BLOB_SECRET_LENGTH: usize = 32;
+
 pub const STREAM_MANIFEST_FORMAT: &str = "vin-yl-tape-stream-v1";
 
 /// A segment is cut when either ceiling is reached, whichever comes first.
@@ -244,6 +253,92 @@ pub fn open_blob(plaintext_sha256: &str, envelope: &[u8]) -> Result<Vec<u8>> {
         "the blob does not match the hash it was opened with"
     );
     Ok(plaintext)
+}
+
+fn keyed_blob_cipher(secret: &[u8]) -> Result<XChaCha20Poly1305> {
+    ensure!(
+        secret.len() == BLOB_SECRET_LENGTH,
+        "the blob secret is not {BLOB_SECRET_LENGTH} bytes"
+    );
+    let hkdf = Hkdf::<Sha256>::new(Some(BLOB_AAD_DOMAIN), secret);
+    let mut key = [0u8; 32];
+    hkdf.expand(BLOB_KEYED_KEY_INFO, &mut key)
+        .map_err(|_| anyhow::anyhow!("the blob key could not be derived"))?;
+    XChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| anyhow::anyhow!("the blob cipher could not be created"))
+}
+
+fn keyed_blob_aad(plaintext_length: usize) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(BLOB_AAD_DOMAIN.len() + 9);
+    aad.extend_from_slice(BLOB_AAD_DOMAIN);
+    aad.push(BLOB_ENVELOPE_VERSION_KEYED);
+    aad.extend_from_slice(&(plaintext_length as u64).to_be_bytes());
+    aad
+}
+
+/// Seals one blob under a secret. The envelope is the 8-byte header, a random
+/// 24-byte nonce and the ciphertext. The same bytes seal differently each
+/// time, so the store cannot tell that two blobs hold the same plaintext.
+pub fn seal_keyed_blob(secret: &[u8], plaintext: &[u8]) -> Result<SealedBlob> {
+    ensure!(!plaintext.is_empty(), "an empty blob cannot be stored");
+    let cipher = keyed_blob_cipher(secret)?;
+    let mut nonce = [0u8; BLOB_NONCE_LENGTH];
+    getrandom::getrandom(&mut nonce).map_err(|_| anyhow::anyhow!("no random nonce is available"))?;
+    let aad = keyed_blob_aad(plaintext.len());
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("the blob could not be sealed"))?;
+
+    let mut header = blob_envelope_header();
+    header[4] = BLOB_ENVELOPE_VERSION_KEYED;
+    let mut bytes =
+        Vec::with_capacity(BLOB_ENVELOPE_HEADER_LENGTH + BLOB_NONCE_LENGTH + ciphertext.len());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&nonce);
+    bytes.extend_from_slice(&ciphertext);
+
+    Ok(SealedBlob {
+        key: format!("{BLOB_PREFIX}/{}", sha256_hex(&bytes)),
+        plaintext_sha256: sha256_hex(plaintext),
+        bytes,
+    })
+}
+
+/// Opens a keyed blob with the secret it was sealed under.
+pub fn open_keyed_blob(secret: &[u8], envelope: &[u8]) -> Result<Vec<u8>> {
+    let body = BLOB_ENVELOPE_HEADER_LENGTH + BLOB_NONCE_LENGTH;
+    ensure!(envelope.len() > body + 16, "the blob envelope is truncated");
+    ensure!(
+        &envelope[0..4] == BLOB_ENVELOPE_MAGIC,
+        "the blob envelope is not a tape blob"
+    );
+    ensure!(
+        envelope[4] == BLOB_ENVELOPE_VERSION_KEYED,
+        "the blob envelope is not a keyed blob"
+    );
+    ensure!(
+        envelope[5] == BLOB_ENVELOPE_ALGORITHM_XCHACHA20POLY1305,
+        "the blob envelope algorithm is unsupported"
+    );
+    let cipher = keyed_blob_cipher(secret)?;
+    let nonce = &envelope[BLOB_ENVELOPE_HEADER_LENGTH..body];
+    let ciphertext = &envelope[body..];
+    let aad = keyed_blob_aad(ciphertext.len() - 16);
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("the blob could not be opened"))
 }
 
 /// One frame's place in a SoundKit v2 stream.
@@ -445,6 +540,19 @@ mod tests {
     use super::*;
     use frame_header::Endianness;
     use std::io::Cursor;
+
+    #[test]
+    fn a_keyed_blob_opens_only_with_its_secret() {
+        let secret = [7u8; BLOB_SECRET_LENGTH];
+        let first = seal_keyed_blob(&secret, b"a master").unwrap();
+        let second = seal_keyed_blob(&secret, b"a master").unwrap();
+        assert_ne!(first.bytes, second.bytes, "each seal takes a fresh nonce");
+        assert_eq!(first.key, format!("blob/{}", sha256_hex(&first.bytes)));
+        assert_eq!(open_keyed_blob(&secret, &first.bytes).unwrap(), b"a master");
+        assert!(open_keyed_blob(&[8u8; BLOB_SECRET_LENGTH], &first.bytes).is_err());
+        assert!(open_blob(&first.plaintext_sha256, &first.bytes).is_err());
+        assert!(seal_keyed_blob(&[1u8; 16], b"a master").is_err());
+    }
 
     /// A SoundKit v2 stream with `frames` frames of `payload` bytes each, the
     /// way an encoder writes one.
